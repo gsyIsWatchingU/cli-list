@@ -1,0 +1,32 @@
+[
+  {
+    "Name": "目录 PowerShell",
+    "Description": "浏览并预览文件，然后在指定目录打开 PowerShell",
+    "Action": "BrowsePowerShell",
+    "CloseAfterLaunch": false
+  },
+  {
+    "Name": "打开 PowerShell",
+    "Description": "在当前目录启动新的 PowerShell 窗口",
+    "Executable": "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    "Arguments": "-NoExit",
+    "WorkingDirectory": "{context}",
+    "CloseAfterLaunch": true
+  },
+  {
+    "Name": "在资源管理器中打开",
+    "Description": "使用资源管理器打开当前目录",
+    "Executable": "explorer.exe",
+    "Arguments": "\"{context}\"",
+    "WorkingDirectory": "{context}",
+    "CloseAfterLaunch": true
+  },
+  {
+    "Name": "使用 VS Code 打开",
+    "Description": "在当前目录启动 Visual Studio Code",
+    "Executable": "code.cmd",
+    "Arguments": ".",
+    "WorkingDirectory": "{context}",
+    "CloseAfterLaunch": true
+  }
+]
