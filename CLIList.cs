@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Web.Script.Serialization;
@@ -12,13 +13,96 @@ namespace CliListApp
 {
     public sealed class CommandItem
     {
+        public string Id { get; set; }
         public string Name { get; set; }
         public string Description { get; set; }
+        public List<string> Tags { get; set; }
         public string Action { get; set; }
         public string Executable { get; set; }
         public string Arguments { get; set; }
         public string WorkingDirectory { get; set; }
         public bool CloseAfterLaunch { get; set; }
+    }
+
+    public sealed class CommandUsage
+    {
+        public int Count { get; set; }
+        public string LastUsedUtc { get; set; }
+    }
+
+    internal sealed class UsageTracker
+    {
+        private readonly string usagePath;
+        private readonly JavaScriptSerializer serializer = new JavaScriptSerializer();
+        private Dictionary<string, CommandUsage> usages;
+
+        public UsageTracker(string usagePath)
+        {
+            this.usagePath = usagePath;
+            usages = Load();
+        }
+
+        public CommandUsage Get(CommandItem command)
+        {
+            CommandUsage usage;
+            return usages.TryGetValue(GetKey(command), out usage) ? usage : new CommandUsage();
+        }
+
+        public void Record(CommandItem command)
+        {
+            string key = GetKey(command);
+            CommandUsage usage;
+            if (!usages.TryGetValue(key, out usage))
+            {
+                usage = new CommandUsage();
+                usages[key] = usage;
+            }
+
+            usage.Count++;
+            usage.LastUsedUtc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+            try
+            {
+                Save();
+            }
+            catch
+            {
+                // 统计失败不应阻止 CLI 本身启动；当前会话仍保留内存计数。
+            }
+        }
+
+        public static string GetKey(CommandItem command)
+        {
+            return string.IsNullOrWhiteSpace(command.Id) ? command.Name.Trim() : command.Id.Trim();
+        }
+
+        private Dictionary<string, CommandUsage> Load()
+        {
+            if (!File.Exists(usagePath))
+            {
+                return new Dictionary<string, CommandUsage>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            try
+            {
+                string json = File.ReadAllText(usagePath);
+                Dictionary<string, CommandUsage> loaded = serializer.Deserialize<Dictionary<string, CommandUsage>>(json);
+                return loaded == null
+                    ? new Dictionary<string, CommandUsage>(StringComparer.OrdinalIgnoreCase)
+                    : new Dictionary<string, CommandUsage>(loaded, StringComparer.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return new Dictionary<string, CommandUsage>(StringComparer.OrdinalIgnoreCase);
+            }
+        }
+
+        private void Save()
+        {
+            string temporaryPath = usagePath + ".tmp";
+            File.WriteAllText(temporaryPath, serializer.Serialize(usages));
+            File.Copy(temporaryPath, usagePath, true);
+            File.Delete(temporaryPath);
+        }
     }
 
     internal static class Program
@@ -36,6 +120,7 @@ namespace CliListApp
             {
                 string appDirectory = AppDomain.CurrentDomain.BaseDirectory;
                 string configPath = Path.Combine(appDirectory, "commands.json");
+                string usagePath = Path.Combine(appDirectory, "usage.json");
                 List<CommandItem> commands = LoadCommands(configPath);
 
                 if (validateOnly)
@@ -61,7 +146,7 @@ namespace CliListApp
                     return;
                 }
 
-                var form = new MainForm(appDirectory, configPath, contextPath, commands);
+                var form = new MainForm(appDirectory, configPath, contextPath, commands, new UsageTracker(usagePath));
 
                 if (!string.IsNullOrWhiteSpace(screenshotPath))
                 {
@@ -175,6 +260,7 @@ namespace CliListApp
                 throw new InvalidDataException("commands.json 至少需要一个命令。 ");
             }
 
+            var commandKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (CommandItem command in commands)
             {
                 bool isBuiltInAction = string.Equals(command.Action, "BrowsePowerShell", StringComparison.OrdinalIgnoreCase);
@@ -182,6 +268,17 @@ namespace CliListApp
                 {
                     throw new InvalidDataException("每个命令都必须包含 Name，并提供 Executable 或受支持的 Action。 ");
                 }
+
+                if (!commandKeys.Add(UsageTracker.GetKey(command)))
+                {
+                    throw new InvalidDataException("每个命令的 Id 必须唯一；未设置 Id 时 Name 必须唯一。 ");
+                }
+
+                command.Tags = (command.Tags ?? new List<string>())
+                    .Where(tag => !string.IsNullOrWhiteSpace(tag))
+                    .Select(tag => tag.Trim())
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
             }
 
             return commands;
@@ -215,6 +312,8 @@ namespace CliListApp
         private readonly string appDirectory;
         private readonly string configPath;
         private readonly string contextPath;
+        private readonly IList<CommandItem> commands;
+        private readonly UsageTracker usageTracker;
         private readonly Color background = Color.FromArgb(244, 245, 239);
         private readonly Color surface = Color.FromArgb(255, 255, 252);
         private readonly Color surfaceHover = Color.FromArgb(226, 235, 224);
@@ -222,17 +321,24 @@ namespace CliListApp
         private readonly Color textSecondary = Color.FromArgb(91, 102, 94);
         private readonly Color accent = Color.FromArgb(151, 179, 155);
         private readonly Color border = Color.FromArgb(23, 28, 24);
+        private TextBox searchBox;
+        private ComboBox tagFilter;
+        private ComboBox sortBox;
+        private Label summaryLabel;
+        private FlowLayoutPanel commandList;
 
-        public MainForm(string appDirectory, string configPath, string contextPath, IList<CommandItem> commands)
+        public MainForm(string appDirectory, string configPath, string contextPath, IList<CommandItem> commands, UsageTracker usageTracker)
         {
             this.appDirectory = appDirectory;
             this.configPath = configPath;
             this.contextPath = contextPath;
+            this.commands = commands;
+            this.usageTracker = usageTracker;
 
             Text = "CLI List";
             StartPosition = FormStartPosition.CenterScreen;
-            MinimumSize = new Size(600, 560);
-            Size = new Size(660, 700);
+            MinimumSize = new Size(660, 620);
+            Size = new Size(720, 760);
             BackColor = background;
             ForeColor = textPrimary;
             Font = new Font("Consolas", 9F, FontStyle.Regular, GraphicsUnit.Point);
@@ -251,18 +357,24 @@ namespace CliListApp
                 Dock = DockStyle.Fill,
                 BackColor = background,
                 ColumnCount = 1,
-                RowCount = 3,
+                RowCount = 4,
                 Padding = new Padding(24, 22, 24, 20)
             };
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 112F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 82F));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 58F));
 
             root.Controls.Add(CreateHeader(), 0, 0);
-            root.Controls.Add(CreateCommandList(commands), 0, 1);
-            root.Controls.Add(CreateFooter(), 0, 2);
+            root.Controls.Add(CreateFilters(), 0, 1);
+            root.Controls.Add(CreateCommandList(), 0, 2);
+            root.Controls.Add(CreateFooter(), 0, 3);
             Controls.Add(root);
+
+            KeyPreview = true;
+            KeyDown += HandleShortcut;
+            RefreshCommandList();
         }
 
         private Control CreateHeader()
@@ -291,7 +403,7 @@ namespace CliListApp
                 Font = new Font("Consolas", 8.5F, FontStyle.Regular),
                 AutoEllipsis = true,
                 Location = new Point(2, 72),
-                Width = 560,
+                Width = 620,
                 Height = 20,
                 Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Top
             };
@@ -310,9 +422,135 @@ namespace CliListApp
             return panel;
         }
 
-        private Control CreateCommandList(IList<CommandItem> commands)
+        private Control CreateFilters()
         {
-            var list = new FlowLayoutPanel
+            var panel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 3,
+                RowCount = 2,
+                Padding = new Padding(0, 12, 0, 8)
+            };
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 132F));
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 132F));
+            panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 32F));
+            panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 26F));
+
+            searchBox = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                AutoSize = false,
+                Margin = Padding.Empty,
+                Font = new Font("Microsoft YaHei UI", 9F),
+                BorderStyle = BorderStyle.None,
+                BackColor = surface,
+                ForeColor = textPrimary
+            };
+            searchBox.TextChanged += (sender, eventArgs) => RefreshCommandList();
+
+            tagFilter = CreateFilterComboBox();
+            tagFilter.Items.Add("全部标签");
+            foreach (string tag in commands.SelectMany(command => command.Tags).Distinct(StringComparer.OrdinalIgnoreCase).OrderBy(tag => tag))
+            {
+                tagFilter.Items.Add("# " + tag);
+            }
+            tagFilter.SelectedIndex = 0;
+            tagFilter.SelectedIndexChanged += (sender, eventArgs) => RefreshCommandList();
+
+            sortBox = CreateFilterComboBox();
+            sortBox.Items.AddRange(new object[] { "默认排序", "使用最多", "最近使用" });
+            sortBox.SelectedIndex = 0;
+            sortBox.SelectedIndexChanged += (sender, eventArgs) => RefreshCommandList();
+
+            summaryLabel = new Label
+            {
+                Dock = DockStyle.Fill,
+                AutoEllipsis = true,
+                ForeColor = textSecondary,
+                Font = new Font("Consolas", 8.5F),
+                TextAlign = ContentAlignment.BottomLeft,
+                Margin = new Padding(2, 2, 0, 0)
+            };
+
+            panel.Controls.Add(CreateFilterFrame(searchBox, new Padding(0, 0, 8, 0)), 0, 0);
+            panel.Controls.Add(CreateFilterFrame(tagFilter, new Padding(0, 0, 8, 0)), 1, 0);
+            panel.Controls.Add(CreateFilterFrame(sortBox, Padding.Empty), 2, 0);
+            panel.Controls.Add(summaryLabel, 0, 1);
+            panel.SetColumnSpan(summaryLabel, 3);
+            return panel;
+        }
+
+        private ComboBox CreateFilterComboBox()
+        {
+            var comboBox = new ComboBox
+            {
+                Dock = DockStyle.Fill,
+                Margin = Padding.Empty,
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                FlatStyle = FlatStyle.Flat,
+                DrawMode = DrawMode.OwnerDrawFixed,
+                // 下拉框总高度约为 ItemHeight + 6；20px 可完整落在 28px 内容区内，
+                // 避免原生控件覆盖外层 2px 底边框。
+                ItemHeight = 20,
+                Font = new Font("Microsoft YaHei UI", 9F),
+                BackColor = surface,
+                ForeColor = textPrimary
+            };
+            comboBox.DrawItem += DrawFilterItem;
+            return comboBox;
+        }
+
+        private Control CreateFilterFrame(Control control, Padding margin)
+        {
+            var frame = new Panel
+            {
+                Dock = DockStyle.Fill,
+                Margin = margin,
+                Padding = new Padding(2),
+                BackColor = border
+            };
+            control.Dock = DockStyle.Fill;
+            control.Margin = Padding.Empty;
+            control.Enter += (sender, eventArgs) => frame.BackColor = accent;
+            control.Leave += (sender, eventArgs) => frame.BackColor = border;
+            frame.Controls.Add(control);
+            return frame;
+        }
+
+        private void DrawFilterItem(object sender, DrawItemEventArgs eventArgs)
+        {
+            var comboBox = sender as ComboBox;
+            if (comboBox == null || eventArgs.Index < 0)
+            {
+                return;
+            }
+
+            bool selected = (eventArgs.State & DrawItemState.Selected) == DrawItemState.Selected;
+            using (var brush = new SolidBrush(selected ? accent : surface))
+            {
+                eventArgs.Graphics.FillRectangle(brush, eventArgs.Bounds);
+            }
+
+            TextRenderer.DrawText(
+                eventArgs.Graphics,
+                comboBox.Items[eventArgs.Index].ToString(),
+                comboBox.Font,
+                new Rectangle(eventArgs.Bounds.X + 8, eventArgs.Bounds.Y, Math.Max(0, eventArgs.Bounds.Width - 10), eventArgs.Bounds.Height),
+                textPrimary,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis
+            );
+
+            if ((eventArgs.State & DrawItemState.Focus) == DrawItemState.Focus)
+            {
+                eventArgs.DrawFocusRectangle();
+            }
+        }
+
+        private Control CreateCommandList()
+        {
+            commandList = new FlowLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 BackColor = background,
@@ -322,16 +560,55 @@ namespace CliListApp
                 Padding = new Padding(0, 14, 6, 8)
             };
 
-            int commandIndex = 1;
-            foreach (CommandItem command in commands)
+            commandList.SizeChanged += (sender, eventArgs) => ResizeCommandCards();
+            return commandList;
+        }
+
+        private void RefreshCommandList()
+        {
+            if (commandList == null || searchBox == null || tagFilter == null || sortBox == null)
             {
+                return;
+            }
+
+            string query = searchBox.Text.Trim();
+            string selectedTag = tagFilter.SelectedIndex <= 0 ? null : tagFilter.SelectedItem.ToString().Substring(2);
+            IEnumerable<CommandItem> filtered = commands.Where(command => MatchesSearch(command, query) &&
+                (selectedTag == null || command.Tags.Contains(selectedTag, StringComparer.OrdinalIgnoreCase)));
+
+            if (sortBox.SelectedIndex == 1)
+            {
+                filtered = filtered.OrderByDescending(command => usageTracker.Get(command).Count).ThenBy(command => command.Name);
+            }
+            else if (sortBox.SelectedIndex == 2)
+            {
+                filtered = filtered.OrderByDescending(command => ParseLastUsed(usageTracker.Get(command).LastUsedUtc)).ThenBy(command => command.Name);
+            }
+
+            List<CommandItem> visibleCommands = filtered.ToList();
+            commandList.SuspendLayout();
+            commandList.Controls.Clear();
+
+            int commandIndex = 1;
+            foreach (CommandItem command in visibleCommands)
+            {
+                CommandUsage usage = usageTracker.Get(command);
+                string tagText = command.Tags.Count == 0 ? "# 未分类" : string.Join("  ", command.Tags.Select(tag => "# " + tag));
+                string usageText = "RUN " + usage.Count + " 次";
+                DateTime lastUsed = ParseLastUsed(usage.LastUsedUtc);
+                if (lastUsed != DateTime.MinValue)
+                {
+                    usageText += "  ·  LAST " + lastUsed.ToLocalTime().ToString("MM-dd HH:mm");
+                }
+
                 var button = new Button
                 {
                     Tag = command,
                     Text = "[" + commandIndex.ToString("00") + "]  " + command.Name + Environment.NewLine +
-                           "      " + (command.Description ?? string.Empty),
-                    Height = 74,
-                    Width = 548,
+                           "      " + (command.Description ?? string.Empty) + Environment.NewLine +
+                           "      " + tagText + "    " + usageText,
+                    Height = 88,
+                    Width = 608,
                     Margin = new Padding(0, 0, 0, 12),
                     Padding = new Padding(15, 0, 14, 0),
                     TextAlign = ContentAlignment.MiddleLeft,
@@ -349,20 +626,86 @@ namespace CliListApp
                 button.MouseEnter += (sender, eventArgs) => ((Button)sender).BackColor = surfaceHover;
                 button.MouseLeave += (sender, eventArgs) => ((Button)sender).BackColor = surface;
                 button.Click += LaunchCommand;
-                list.Controls.Add(button);
+                commandList.Controls.Add(button);
                 commandIndex++;
             }
 
-            list.SizeChanged += (sender, eventArgs) =>
+            if (visibleCommands.Count == 0)
             {
-                int width = Math.Max(320, list.ClientSize.Width - 14);
-                foreach (Control control in list.Controls)
+                commandList.Controls.Add(new Label
                 {
-                    control.Width = width;
-                }
-            };
+                    Text = "> 未找到匹配的 CLI\n  请调整关键词或标签筛选。",
+                    Width = 608,
+                    Height = 72,
+                    Padding = new Padding(14, 16, 14, 0),
+                    Margin = Padding.Empty,
+                    BackColor = surface,
+                    ForeColor = textSecondary,
+                    BorderStyle = BorderStyle.FixedSingle,
+                    Font = new Font("Microsoft YaHei UI", 9.5F)
+                });
+            }
 
-            return list;
+            // FlowLayoutPanel 在自动滚动时不会稳定保留最后一个控件的尾部 Margin。
+            // 使用独立占位控件扩展滚动范围，避免末项下边框紧贴底部操作栏。
+            commandList.Controls.Add(new Panel
+            {
+                Height = 12,
+                Width = 608,
+                Margin = Padding.Empty,
+                BackColor = background
+            });
+            summaryLabel.Text = "SEARCH  名称 / 描述 / 标签    CLI  " + visibleCommands.Count + " / " + commands.Count +
+                                "    TOTAL RUN  " + commands.Sum(command => usageTracker.Get(command).Count);
+            commandList.ResumeLayout();
+            ResizeCommandCards();
+        }
+
+        private void ResizeCommandCards()
+        {
+            if (commandList == null)
+            {
+                return;
+            }
+
+            int width = Math.Max(360, commandList.ClientSize.Width - 14);
+            foreach (Control control in commandList.Controls)
+            {
+                control.Width = width;
+            }
+        }
+
+        private static bool MatchesSearch(CommandItem command, string query)
+        {
+            if (string.IsNullOrWhiteSpace(query))
+            {
+                return true;
+            }
+
+            return (command.Name ?? string.Empty).IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   (command.Description ?? string.Empty).IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   command.Tags.Any(tag => tag.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+
+        private static DateTime ParseLastUsed(string value)
+        {
+            DateTime parsed;
+            return DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out parsed) ? parsed : DateTime.MinValue;
+        }
+
+        private void HandleShortcut(object sender, KeyEventArgs eventArgs)
+        {
+            if (eventArgs.Control && eventArgs.KeyCode == Keys.F)
+            {
+                searchBox.Focus();
+                searchBox.SelectAll();
+                eventArgs.SuppressKeyPress = true;
+            }
+            else if (eventArgs.KeyCode == Keys.Escape && !string.IsNullOrEmpty(searchBox.Text))
+            {
+                searchBox.Clear();
+                eventArgs.SuppressKeyPress = true;
+            }
         }
 
         private Control CreateFooter()
@@ -437,6 +780,8 @@ namespace CliListApp
             {
                 if (string.Equals(command.Action, "BrowsePowerShell", StringComparison.OrdinalIgnoreCase))
                 {
+                    usageTracker.Record(command);
+                    RefreshCommandList();
                     using (var browser = new DirectoryBrowserForm(appDirectory, contextPath))
                     {
                         if (browser.ShowDialog(this) == DialogResult.OK)
@@ -460,6 +805,8 @@ namespace CliListApp
                     UseShellExecute = true
                 };
                 Process.Start(startInfo);
+                usageTracker.Record(command);
+                RefreshCommandList();
 
                 if (command.CloseAfterLaunch)
                 {

@@ -9,11 +9,30 @@ $compilerCandidates = @(
 )
 $compilerPath = $compilerCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 
+$iconSourcePaths = @(
+    (Join-Path $PSScriptRoot 'cli-list.svg'),
+    (Join-Path $PSScriptRoot 'render-icon.html'),
+    (Join-Path $PSScriptRoot 'generate-icon.ps1')
+)
+$shouldGenerateIcon = -not (Test-Path -LiteralPath $iconPath)
+if (-not $shouldGenerateIcon) {
+    $iconWriteTime = (Get-Item -LiteralPath $iconPath).LastWriteTimeUtc
+    $newerIconSource = $iconSourcePaths |
+        Where-Object { (Test-Path -LiteralPath $_) -and (Get-Item -LiteralPath $_).LastWriteTimeUtc -gt $iconWriteTime } |
+        Select-Object -First 1
+    $shouldGenerateIcon = $null -ne $newerIconSource
+}
+
+if ($shouldGenerateIcon) {
+    & (Join-Path $PSScriptRoot 'generate-icon.ps1')
+}
+else {
+    Write-Output '图标资源未变化，复用现有 cli-list.ico。'
+}
+
 if (Test-Path -LiteralPath $outputPath) {
     Remove-Item -LiteralPath $outputPath -Force
 }
-
-& (Join-Path $PSScriptRoot 'generate-icon.ps1')
 
 if (-not $compilerPath) {
     throw '未找到 .NET Framework 4.x C# 编译器。'
@@ -36,3 +55,22 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Output "已生成：$outputPath"
+
+$installDirectory = Join-Path $env:USERPROFILE '.cli-list'
+$installedExecutablePath = Join-Path $installDirectory 'CLIList.exe'
+$installedSourcePath = Join-Path $installDirectory 'CLIList.cs'
+
+if (Test-Path -LiteralPath $installDirectory) {
+    $runningProcesses = Get-Process -Name 'CLIList' -ErrorAction SilentlyContinue
+    if ($runningProcesses) {
+        $runningProcesses | Stop-Process -Force
+        $runningProcesses | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+    }
+
+    Copy-Item -LiteralPath $outputPath -Destination $installedExecutablePath -Force
+    Copy-Item -LiteralPath $sourcePath -Destination $installedSourcePath -Force
+    Write-Output "已同步安装版：$installedExecutablePath"
+}
+else {
+    Write-Output '未检测到安装目录，跳过安装版同步。首次使用请运行 install.ps1。'
+}

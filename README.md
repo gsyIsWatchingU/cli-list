@@ -8,6 +8,8 @@ CLI List 是一个面向 Windows 的轻量命令面板。它会在资源管理�
 
 - 在桌面、目录、文件和磁盘的右键菜单中打开命令面板。
 - 通过 `commands.json` 管理可执行命令，无需重新编译。
+- 支持关键词搜索、标签筛选，并可按使用次数或最近使用排序。
+- 在本地 `usage.json` 中记录每个 CLI 的执行次数和最近使用时间。
 - 在当前目录直接启动 PowerShell 或其他 CLI。
 - 浏览目录并预览文本、代码与常见图片。
 - 提供桌面快捷方式和 `cli-list` 终端命令。
@@ -58,6 +60,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 {
   "Name": "打开 PowerShell",
   "Description": "在当前目录启动 PowerShell",
+  "Id": "open-powershell",
+  "Tags": ["终端", "本地"],
   "Executable": "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
   "Arguments": "-NoExit",
   "WorkingDirectory": "{context}",
@@ -66,6 +70,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 ```
 
 `{context}` 表示打开 CLI List 时所在的目录。内置动作 `BrowsePowerShell` 用于打开目录浏览与文件预览窗口。
+`Id` 用于关联使用统计，应保持唯一且不要随意修改；`Tags` 用于搜索和标签筛选。统计数据只保存在本机，不会上传。
 
 ## 卸载
 

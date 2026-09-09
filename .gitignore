@@ -10,6 +10,10 @@ cli-list-icon.png
 *.png
 !assets/screenshot.png
 
+# 本地使用统计
+usage.json
+usage.json.tmp
+
 # 编辑器与系统文件
 .vs/
 .vscode/

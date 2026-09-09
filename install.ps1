@@ -24,6 +24,9 @@ Copy-Item -LiteralPath (Join-Path $SourceDirectory 'CLIList.exe') -Destination $
 Copy-Item -LiteralPath (Join-Path $SourceDirectory 'CLIList.cs') -Destination (Join-Path $installDirectory 'CLIList.cs') -Force
 Copy-Item -LiteralPath (Join-Path $SourceDirectory 'cli-list.ico') -Destination $iconPath -Force
 Copy-Item -LiteralPath (Join-Path $SourceDirectory 'cli-list.svg') -Destination (Join-Path $installDirectory 'cli-list.svg') -Force
+Copy-Item -LiteralPath (Join-Path $SourceDirectory 'gpu-trae.vbs') -Destination (Join-Path $installDirectory 'gpu-trae.vbs') -Force
+Copy-Item -LiteralPath (Join-Path $SourceDirectory 'skill-atlas-dev.cmd') -Destination (Join-Path $installDirectory 'skill-atlas-dev.cmd') -Force
+Copy-Item -LiteralPath (Join-Path $SourceDirectory 'skill-atlas-dev.vbs') -Destination (Join-Path $installDirectory 'skill-atlas-dev.vbs') -Force
 $installedConfigPath = Join-Path $installDirectory 'commands.json'
 if ($ReplaceConfig -or -not (Test-Path -LiteralPath $installedConfigPath)) {
     Copy-Item -LiteralPath (Join-Path $SourceDirectory 'commands.json') -Destination $installedConfigPath -Force
