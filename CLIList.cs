@@ -784,10 +784,7 @@ namespace CliListApp
                     RefreshCommandList();
                     using (var browser = new DirectoryBrowserForm(appDirectory, contextPath))
                     {
-                        if (browser.ShowDialog(this) == DialogResult.OK)
-                        {
-                            Close();
-                        }
+                        browser.ShowDialog(this);
                     }
                     return;
                 }
@@ -807,11 +804,6 @@ namespace CliListApp
                 Process.Start(startInfo);
                 usageTracker.Record(command);
                 RefreshCommandList();
-
-                if (command.CloseAfterLaunch)
-                {
-                    Close();
-                }
             }
             catch (Exception exception)
             {
