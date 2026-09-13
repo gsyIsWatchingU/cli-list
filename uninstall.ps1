@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $currentPrincipal = [Security.Principal.WindowsPrincipal]::new($currentIdentity)
@@ -28,6 +28,8 @@ foreach ($registryPath in $registryPaths) {
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'CLI List.lnk'
 $residentShortcutPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'CLI List Resident.lnk'
 $commandPath = Join-Path $env:USERPROFILE 'bin\cli-list.cmd'
+$installDirectory = Join-Path $env:USERPROFILE '.cli-list'
+$sourceMarkerPath = Join-Path $installDirectory '.source-repository'
 
 Get-Process -Name 'CLIList' -ErrorAction SilentlyContinue | Stop-Process -Force
 
@@ -40,6 +42,16 @@ if (Test-Path -LiteralPath $commandPath) {
 if (Test-Path -LiteralPath $residentShortcutPath) {
     Remove-Item -LiteralPath $residentShortcutPath -Force
 }
+if (Test-Path -LiteralPath $sourceMarkerPath) {
+    $sourceRepository = (Get-Content -LiteralPath $sourceMarkerPath -Raw).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($sourceRepository) -and (Test-Path -LiteralPath (Join-Path $sourceRepository '.git'))) {
+        $configuredHooksPath = (& git -C $sourceRepository config --local --get core.hooksPath 2>$null)
+        if ($configuredHooksPath -eq '.githooks') {
+            & git -C $sourceRepository config --local --unset-all core.hooksPath
+        }
+    }
+    Remove-Item -LiteralPath $sourceMarkerPath -Force
+}
 
 Write-Output 'CLI List 右键菜单、桌面入口和终端命令已移除。'
-Write-Output "程序配置仍保留在：$(Join-Path $env:USERPROFILE '.cli-list')"
+Write-Output "程序配置仍保留在：$installDirectory"

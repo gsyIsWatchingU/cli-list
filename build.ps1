@@ -1,3 +1,7 @@
+﻿param(
+    [switch]$SkipInstalledSync
+)
+
 $ErrorActionPreference = 'Stop'
 
 $sourcePath = Join-Path $PSScriptRoot 'CLIList.cs'
@@ -60,7 +64,7 @@ $installDirectory = Join-Path $env:USERPROFILE '.cli-list'
 $installedExecutablePath = Join-Path $installDirectory 'CLIList.exe'
 $installedSourcePath = Join-Path $installDirectory 'CLIList.cs'
 
-if (Test-Path -LiteralPath $installDirectory) {
+if (-not $SkipInstalledSync -and (Test-Path -LiteralPath $installDirectory)) {
     $runningProcesses = Get-Process -Name 'CLIList' -ErrorAction SilentlyContinue
     $shouldRestartResident = $null -ne $runningProcesses
     if ($runningProcesses) {
@@ -85,6 +89,9 @@ if (Test-Path -LiteralPath $installDirectory) {
         Start-Process -FilePath $installedExecutablePath -ArgumentList '--resident'
     }
     Write-Output "已同步安装版：$installedExecutablePath"
+}
+elseif ($SkipInstalledSync) {
+    Write-Output '已跳过安装版同步。'
 }
 else {
     Write-Output '未检测到安装目录，跳过安装版同步。首次使用请运行 install.ps1。'

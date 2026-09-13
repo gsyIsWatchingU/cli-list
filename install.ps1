@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$SourceDirectory = $PSScriptRoot,
     [switch]$ReplaceConfig
 )
@@ -18,39 +18,26 @@ $startupDirectory = [Environment]::GetFolderPath('Startup')
 $executablePath = Join-Path $installDirectory 'CLIList.exe'
 $iconPath = Join-Path $installDirectory 'cli-list.ico'
 
+& (Join-Path $SourceDirectory 'test.ps1') -SkipInstalledSync
+
 New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
 New-Item -ItemType Directory -Path $binDirectory -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $installDirectory '.source-repository') -Value ([IO.Path]::GetFullPath($SourceDirectory)) -Encoding UTF8
 
-$runningProcesses = Get-Process -Name 'CLIList' -ErrorAction SilentlyContinue
-if ($runningProcesses) {
-    $runningProcesses | Stop-Process -Force
-    $runningProcesses | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
-}
-
-for ($attempt = 1; $attempt -le 10; $attempt++) {
-    try {
-        Copy-Item -LiteralPath (Join-Path $SourceDirectory 'CLIList.exe') -Destination $executablePath -Force
-        break
-    }
-    catch {
-        if ($attempt -eq 10) {
-            throw
-        }
-        Start-Sleep -Milliseconds 300
-    }
-}
-Copy-Item -LiteralPath (Join-Path $SourceDirectory 'CLIList.cs') -Destination (Join-Path $installDirectory 'CLIList.cs') -Force
-Copy-Item -LiteralPath (Join-Path $SourceDirectory 'cli-list.ico') -Destination $iconPath -Force
-Copy-Item -LiteralPath (Join-Path $SourceDirectory 'cli-list.svg') -Destination (Join-Path $installDirectory 'cli-list.svg') -Force
-Copy-Item -LiteralPath (Join-Path $SourceDirectory 'gpu-trae.vbs') -Destination (Join-Path $installDirectory 'gpu-trae.vbs') -Force
-Copy-Item -LiteralPath (Join-Path $SourceDirectory 'skill-atlas-dev.cmd') -Destination (Join-Path $installDirectory 'skill-atlas-dev.cmd') -Force
-Copy-Item -LiteralPath (Join-Path $SourceDirectory 'skill-atlas-dev.vbs') -Destination (Join-Path $installDirectory 'skill-atlas-dev.vbs') -Force
 $installedConfigPath = Join-Path $installDirectory 'commands.json'
-if ($ReplaceConfig -or -not (Test-Path -LiteralPath $installedConfigPath)) {
-    Copy-Item -LiteralPath (Join-Path $SourceDirectory 'commands.json') -Destination $installedConfigPath -Force
+if ($ReplaceConfig) {
+    $localConfigPath = Join-Path $installDirectory 'commands.local.json'
+    Set-Content -LiteralPath $localConfigPath -Value '[]' -Encoding UTF8
 }
-Copy-Item -LiteralPath (Join-Path $SourceDirectory 'uninstall.ps1') -Destination (Join-Path $installDirectory 'uninstall.ps1') -Force
-Copy-Item -LiteralPath (Join-Path $SourceDirectory 'cli-list.cmd') -Destination (Join-Path $binDirectory 'cli-list.cmd') -Force
+
+& (Join-Path $SourceDirectory 'sync-installed.ps1') -SkipBuild -NoRestart
+
+if (Test-Path -LiteralPath (Join-Path $SourceDirectory '.git')) {
+    & git -C $SourceDirectory config --local core.hooksPath .githooks
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Git Hook 配置失败。'
+    }
+}
 
 function Install-ContextMenuEntry {
     param(

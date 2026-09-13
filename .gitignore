@@ -14,6 +14,8 @@ cli-list-icon.png
 # 本地使用统计
 usage.json
 usage.json.tmp
+commands.local.json
+commands.pre-shared-migration.json
 
 # 编辑器与系统文件
 .vs/

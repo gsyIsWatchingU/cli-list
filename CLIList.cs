@@ -26,6 +26,7 @@ namespace CliListApp
         public string Arguments { get; set; }
         public string WorkingDirectory { get; set; }
         public bool CloseAfterLaunch { get; set; }
+        public bool Disabled { get; set; }
     }
 
     public sealed class CommandUsage
@@ -292,9 +293,10 @@ namespace CliListApp
 
         internal static MainForm CreateMainForm(string appDirectory, string configPath, string usagePath, string contextPath)
         {
+            string localConfigPath = GetLocalConfigPath(configPath);
             return new MainForm(
                 appDirectory,
-                configPath,
+                localConfigPath,
                 contextPath,
                 LoadCommands(configPath),
                 new UsageTracker(usagePath)
@@ -302,6 +304,72 @@ namespace CliListApp
         }
 
         internal static List<CommandItem> LoadCommands(string configPath)
+        {
+            List<CommandItem> commands = ReadCommands(configPath, false);
+            ValidateCommands(commands, false, Path.GetFileName(configPath));
+
+            string localConfigPath = GetLocalConfigPath(configPath);
+            if (!File.Exists(localConfigPath))
+            {
+                return commands;
+            }
+
+            List<CommandItem> localCommands = ReadCommands(localConfigPath, true);
+            ValidateCommands(localCommands, true, Path.GetFileName(localConfigPath));
+
+            foreach (CommandItem localCommand in localCommands)
+            {
+                string localKey = GetCommandKey(localCommand);
+                int existingIndex = commands.FindIndex(command => string.Equals(
+                    GetCommandKey(command),
+                    localKey,
+                    StringComparison.OrdinalIgnoreCase
+                ));
+
+                if (localCommand.Disabled)
+                {
+                    if (existingIndex >= 0)
+                    {
+                        commands.RemoveAt(existingIndex);
+                    }
+                    continue;
+                }
+
+                if (existingIndex >= 0)
+                {
+                    commands[existingIndex] = localCommand;
+                }
+                else
+                {
+                    commands.Add(localCommand);
+                }
+            }
+
+            ValidateCommands(commands, false, "合并后的命令配置");
+            return commands;
+        }
+
+        internal static string GetLocalConfigPath(string configPath)
+        {
+            return Path.Combine(Path.GetDirectoryName(configPath), "commands.local.json");
+        }
+
+        internal static void EnsureLocalConfigFile(string localConfigPath)
+        {
+            if (File.Exists(localConfigPath))
+            {
+                return;
+            }
+
+            string directoryPath = Path.GetDirectoryName(localConfigPath);
+            if (!Directory.Exists(directoryPath))
+            {
+                Directory.CreateDirectory(directoryPath);
+            }
+            File.WriteAllText(localConfigPath, "[]" + Environment.NewLine, new UTF8Encoding(false));
+        }
+
+        private static List<CommandItem> ReadCommands(string configPath, bool allowEmpty)
         {
             if (!File.Exists(configPath))
             {
@@ -312,23 +380,50 @@ namespace CliListApp
             var serializer = new JavaScriptSerializer();
             List<CommandItem> commands = serializer.Deserialize<List<CommandItem>>(json);
 
-            if (commands == null || commands.Count == 0)
+            if (commands == null || (!allowEmpty && commands.Count == 0))
             {
                 throw new InvalidDataException("commands.json 至少需要一个命令。 ");
+            }
+
+            return commands ?? new List<CommandItem>();
+        }
+
+        private static void ValidateCommands(List<CommandItem> commands, bool allowDisabled, string sourceName)
+        {
+            if (!allowDisabled && commands.Count == 0)
+            {
+                throw new InvalidDataException(sourceName + " 至少需要一个可用命令。 ");
             }
 
             var commandKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (CommandItem command in commands)
             {
+                if (command == null)
+                {
+                    throw new InvalidDataException(sourceName + " 不能包含空命令。 ");
+                }
+
+                if (command.Disabled)
+                {
+                    if (!allowDisabled)
+                    {
+                        throw new InvalidDataException(sourceName + " 不允许包含 Disabled 命令。 ");
+                    }
+                    if (string.IsNullOrWhiteSpace(command.Id) && string.IsNullOrWhiteSpace(command.Name))
+                    {
+                        throw new InvalidDataException("禁用命令必须提供 Id 或 Name。 ");
+                    }
+                }
+
                 bool isBuiltInAction = string.Equals(command.Action, "BrowsePowerShell", StringComparison.OrdinalIgnoreCase);
-                if (string.IsNullOrWhiteSpace(command.Name) || (!isBuiltInAction && string.IsNullOrWhiteSpace(command.Executable)))
+                if (!command.Disabled && (string.IsNullOrWhiteSpace(command.Name) || (!isBuiltInAction && string.IsNullOrWhiteSpace(command.Executable))))
                 {
                     throw new InvalidDataException("每个命令都必须包含 Name，并提供 Executable 或受支持的 Action。 ");
                 }
 
-                if (!commandKeys.Add(UsageTracker.GetKey(command)))
+                if (!commandKeys.Add(GetCommandKey(command)))
                 {
-                    throw new InvalidDataException("每个命令的 Id 必须唯一；未设置 Id 时 Name 必须唯一。 ");
+                    throw new InvalidDataException(sourceName + " 中的命令 Id 必须唯一；未设置 Id 时 Name 必须唯一。 ");
                 }
 
                 command.Tags = (command.Tags ?? new List<string>())
@@ -337,8 +432,11 @@ namespace CliListApp
                     .Distinct(StringComparer.OrdinalIgnoreCase)
                     .ToList();
             }
+        }
 
-            return commands;
+        private static string GetCommandKey(CommandItem command)
+        {
+            return string.IsNullOrWhiteSpace(command.Id) ? command.Name.Trim() : command.Id.Trim();
         }
 
         internal static string ResolveContextDirectory(string suppliedContext)
@@ -1053,12 +1151,16 @@ namespace CliListApp
             });
 
             var editButton = CreateFooterButton("编辑命令");
-            editButton.Click += (sender, eventArgs) => Process.Start(new ProcessStartInfo
+            editButton.Click += (sender, eventArgs) =>
             {
-                FileName = "notepad.exe",
-                Arguments = "\"" + configPath + "\"",
-                UseShellExecute = true
-            });
+                Program.EnsureLocalConfigFile(configPath);
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "notepad.exe",
+                    Arguments = "\"" + configPath + "\"",
+                    UseShellExecute = true
+                });
+            };
 
             footer.Controls.Add(closeButton);
             footer.Controls.Add(folderButton);
