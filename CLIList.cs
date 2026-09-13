@@ -464,6 +464,32 @@ namespace CliListApp
 
     internal sealed class ResidentApplicationContext : ApplicationContext
     {
+        private const int ShowWindowRestore = 9;
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr windowHandle, IntPtr processId);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        [DllImport("user32.dll")]
+        private static extern bool AttachThreadInput(uint attachThreadId, uint attachToThreadId, bool attach);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindowAsync(IntPtr windowHandle, int command);
+
+        [DllImport("user32.dll")]
+        private static extern bool BringWindowToTop(IntPtr windowHandle);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr windowHandle);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetFocus(IntPtr windowHandle);
+
         private readonly string appDirectory;
         private readonly string configPath;
         private readonly string usagePath;
@@ -651,8 +677,40 @@ namespace CliListApp
             {
                 mainForm.WindowState = FormWindowState.Normal;
             }
-            mainForm.Activate();
-            mainForm.BringToFront();
+            ActivateCommandPanel(mainForm);
+        }
+
+        private static void ActivateCommandPanel(Form form)
+        {
+            IntPtr formHandle = form.Handle;
+            IntPtr foregroundHandle = GetForegroundWindow();
+            uint currentThreadId = GetCurrentThreadId();
+            uint foregroundThreadId = foregroundHandle == IntPtr.Zero
+                ? 0
+                : GetWindowThreadProcessId(foregroundHandle, IntPtr.Zero);
+            bool attached = false;
+
+            try
+            {
+                if (foregroundThreadId != 0 && foregroundThreadId != currentThreadId)
+                {
+                    attached = AttachThreadInput(currentThreadId, foregroundThreadId, true);
+                }
+
+                ShowWindowAsync(formHandle, ShowWindowRestore);
+                BringWindowToTop(formHandle);
+                SetForegroundWindow(formHandle);
+                SetFocus(formHandle);
+                form.Activate();
+                form.BringToFront();
+            }
+            finally
+            {
+                if (attached)
+                {
+                    AttachThreadInput(currentThreadId, foregroundThreadId, false);
+                }
+            }
         }
 
         protected override void ExitThreadCore()
