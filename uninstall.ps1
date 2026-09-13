@@ -26,13 +26,19 @@ foreach ($registryPath in $registryPaths) {
 }
 
 $shortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'CLI List.lnk'
+$residentShortcutPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'CLI List Resident.lnk'
 $commandPath = Join-Path $env:USERPROFILE 'bin\cli-list.cmd'
+
+Get-Process -Name 'CLIList' -ErrorAction SilentlyContinue | Stop-Process -Force
 
 if (Test-Path -LiteralPath $shortcutPath) {
     Remove-Item -LiteralPath $shortcutPath -Force
 }
 if (Test-Path -LiteralPath $commandPath) {
     Remove-Item -LiteralPath $commandPath -Force
+}
+if (Test-Path -LiteralPath $residentShortcutPath) {
+    Remove-Item -LiteralPath $residentShortcutPath -Force
 }
 
 Write-Output 'CLI List 右键菜单、桌面入口和终端命令已移除。'

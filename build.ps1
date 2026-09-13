@@ -62,13 +62,28 @@ $installedSourcePath = Join-Path $installDirectory 'CLIList.cs'
 
 if (Test-Path -LiteralPath $installDirectory) {
     $runningProcesses = Get-Process -Name 'CLIList' -ErrorAction SilentlyContinue
+    $shouldRestartResident = $null -ne $runningProcesses
     if ($runningProcesses) {
         $runningProcesses | Stop-Process -Force
         $runningProcesses | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
     }
 
-    Copy-Item -LiteralPath $outputPath -Destination $installedExecutablePath -Force
+    for ($attempt = 1; $attempt -le 10; $attempt++) {
+        try {
+            Copy-Item -LiteralPath $outputPath -Destination $installedExecutablePath -Force
+            break
+        }
+        catch {
+            if ($attempt -eq 10) {
+                throw
+            }
+            Start-Sleep -Milliseconds 300
+        }
+    }
     Copy-Item -LiteralPath $sourcePath -Destination $installedSourcePath -Force
+    if ($shouldRestartResident) {
+        Start-Process -FilePath $installedExecutablePath -ArgumentList '--resident'
+    }
     Write-Output "已同步安装版：$installedExecutablePath"
 }
 else {

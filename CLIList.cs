@@ -5,7 +5,11 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
+using System.IO.Pipes;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
@@ -107,10 +111,14 @@ namespace CliListApp
 
     internal static class Program
     {
+        internal static readonly string ResidentMutexName = @"Local\CliListApp.Resident." + Environment.UserName;
+        internal static readonly string ResidentPipeName = "CliListApp.Resident." + Environment.UserName;
+
         [STAThread]
         private static void Main(string[] args)
         {
             bool validateOnly = args.Any(value => string.Equals(value, "--validate", StringComparison.OrdinalIgnoreCase));
+            bool residentRequested = args.Any(value => string.Equals(value, "--resident", StringComparison.OrdinalIgnoreCase));
             string screenshotPath = GetOptionValue(args, "--screenshot");
             string browserScreenshotPath = GetOptionValue(args, "--screenshot-browser");
             string previewFilePath = GetOptionValue(args, "--preview-file");
@@ -121,10 +129,10 @@ namespace CliListApp
                 string appDirectory = AppDomain.CurrentDomain.BaseDirectory;
                 string configPath = Path.Combine(appDirectory, "commands.json");
                 string usagePath = Path.Combine(appDirectory, "usage.json");
-                List<CommandItem> commands = LoadCommands(configPath);
 
                 if (validateOnly)
                 {
+                    LoadCommands(configPath);
                     Environment.ExitCode = 0;
                     return;
                 }
@@ -146,15 +154,48 @@ namespace CliListApp
                     return;
                 }
 
-                var form = new MainForm(appDirectory, configPath, contextPath, commands, new UsageTracker(usagePath));
-
                 if (!string.IsNullOrWhiteSpace(screenshotPath))
                 {
+                    var form = CreateMainForm(appDirectory, configPath, usagePath, contextPath);
                     RenderScreenshot(form, screenshotPath);
                     return;
                 }
 
-                Application.Run(form);
+                bool ownsMutex;
+                using (var instanceMutex = new Mutex(true, ResidentMutexName, out ownsMutex))
+                {
+                    if (!ownsMutex)
+                    {
+                        if (!ResidentApplicationContext.TryForwardToResident(contextPath, !residentRequested, 1800))
+                        {
+                            MessageBox.Show(
+                                "CLI List 已在运行，但暂时无法连接到驻留进程。请稍后重试。",
+                                "CLI List",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Warning
+                            );
+                        }
+                        return;
+                    }
+
+                    try
+                    {
+                        using (var resident = new ResidentApplicationContext(
+                            appDirectory,
+                            configPath,
+                            usagePath,
+                            contextPath,
+                            !residentRequested
+                        ))
+                        {
+                            Application.Run(resident);
+                        }
+                    }
+                    finally
+                    {
+                        instanceMutex.ReleaseMutex();
+                    }
+                }
             }
             catch (Exception exception)
             {
@@ -193,6 +234,11 @@ namespace CliListApp
             for (int index = 0; index < args.Length; index++)
             {
                 if (string.Equals(args[index], "--validate", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (string.Equals(args[index], "--resident", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;
                 }
@@ -244,7 +290,18 @@ namespace CliListApp
             form.Close();
         }
 
-        private static List<CommandItem> LoadCommands(string configPath)
+        internal static MainForm CreateMainForm(string appDirectory, string configPath, string usagePath, string contextPath)
+        {
+            return new MainForm(
+                appDirectory,
+                configPath,
+                contextPath,
+                LoadCommands(configPath),
+                new UsageTracker(usagePath)
+            );
+        }
+
+        internal static List<CommandItem> LoadCommands(string configPath)
         {
             if (!File.Exists(configPath))
             {
@@ -284,7 +341,7 @@ namespace CliListApp
             return commands;
         }
 
-        private static string ResolveContextDirectory(string suppliedContext)
+        internal static string ResolveContextDirectory(string suppliedContext)
         {
             string fallback = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             if (string.IsNullOrWhiteSpace(suppliedContext))
@@ -307,6 +364,269 @@ namespace CliListApp
         }
     }
 
+    internal sealed class ResidentApplicationContext : ApplicationContext
+    {
+        private readonly string appDirectory;
+        private readonly string configPath;
+        private readonly string usagePath;
+        private readonly NotifyIcon trayIcon;
+        private readonly ContextMenuStrip trayMenu;
+        private readonly Control dispatcher;
+        private readonly GlobalHotKeyWindow hotKeyWindow;
+        private readonly Thread pipeThread;
+        private volatile bool isExiting;
+        private MainForm mainForm;
+        private string currentContext;
+
+        public ResidentApplicationContext(
+            string appDirectory,
+            string configPath,
+            string usagePath,
+            string initialContext,
+            bool initiallyVisible
+        )
+        {
+            this.appDirectory = appDirectory;
+            this.configPath = configPath;
+            this.usagePath = usagePath;
+            currentContext = Program.ResolveContextDirectory(initialContext);
+
+            dispatcher = new Control();
+            IntPtr dispatcherHandle = dispatcher.Handle;
+
+            var openItem = new ToolStripMenuItem("打开 CLI List    Ctrl+Alt+Space");
+            openItem.Click += (sender, eventArgs) => ShowCommandPanel(null, false);
+            var exitItem = new ToolStripMenuItem("退出");
+            exitItem.Click += (sender, eventArgs) => ExitThread();
+
+            trayMenu = new ContextMenuStrip();
+            trayMenu.Items.Add(openItem);
+            trayMenu.Items.Add(new ToolStripSeparator());
+            trayMenu.Items.Add(exitItem);
+
+            string iconPath = Path.Combine(appDirectory, "cli-list.ico");
+            trayIcon = new NotifyIcon
+            {
+                Text = "CLI List · Ctrl+Alt+Space",
+                Icon = File.Exists(iconPath) ? new Icon(iconPath) : SystemIcons.Application,
+                ContextMenuStrip = trayMenu,
+                Visible = true
+            };
+            trayIcon.DoubleClick += (sender, eventArgs) => ShowCommandPanel(null, false);
+
+            hotKeyWindow = new GlobalHotKeyWindow(() => ShowCommandPanel(null, true));
+            if (!hotKeyWindow.Registered)
+            {
+                trayIcon.ShowBalloonTip(
+                    4000,
+                    "CLI List 快捷键不可用",
+                    "Ctrl+Alt+Space 已被其他程序占用，可通过托盘图标打开。",
+                    ToolTipIcon.Warning
+                );
+            }
+
+            pipeThread = new Thread(ListenForContexts)
+            {
+                IsBackground = true,
+                Name = "CLI List context pipe"
+            };
+            pipeThread.Start();
+
+            if (initiallyVisible)
+            {
+                ShowCommandPanel(initialContext, false);
+            }
+        }
+
+        internal static bool TryForwardToResident(string contextPath, bool showPanel, int timeoutMilliseconds)
+        {
+            try
+            {
+                using (var client = new NamedPipeClientStream(".", Program.ResidentPipeName, PipeDirection.Out))
+                {
+                    client.Connect(timeoutMilliseconds);
+                    string encodedContext = Convert.ToBase64String(Encoding.UTF8.GetBytes(contextPath ?? string.Empty));
+                    using (var writer = new StreamWriter(client, new UTF8Encoding(false)))
+                    {
+                        writer.AutoFlush = true;
+                        writer.WriteLine((showPanel ? "1|" : "0|") + encodedContext);
+                    }
+                }
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private void ListenForContexts()
+        {
+            while (!isExiting)
+            {
+                try
+                {
+                    using (var server = new NamedPipeServerStream(
+                        Program.ResidentPipeName,
+                        PipeDirection.In,
+                        1,
+                        PipeTransmissionMode.Byte,
+                        PipeOptions.None
+                    ))
+                    {
+                        server.WaitForConnection();
+                        using (var reader = new StreamReader(server, Encoding.UTF8))
+                        {
+                            string message = reader.ReadLine();
+                            if (isExiting || string.IsNullOrWhiteSpace(message))
+                            {
+                                continue;
+                            }
+
+                            int separatorIndex = message.IndexOf('|');
+                            bool showPanel = separatorIndex > 0 && message.Substring(0, separatorIndex) == "1";
+                            string encodedContext = separatorIndex >= 0 ? message.Substring(separatorIndex + 1) : string.Empty;
+                            string contextPath = Encoding.UTF8.GetString(Convert.FromBase64String(encodedContext));
+                            if (showPanel)
+                            {
+                                dispatcher.BeginInvoke((MethodInvoker)(() => ShowCommandPanel(contextPath, false)));
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    if (!isExiting)
+                    {
+                        Thread.Sleep(100);
+                    }
+                }
+            }
+        }
+
+        private void ShowCommandPanel(string requestedContext, bool toggle)
+        {
+            if (!string.IsNullOrWhiteSpace(requestedContext))
+            {
+                currentContext = Program.ResolveContextDirectory(requestedContext);
+            }
+            string contextPath = currentContext;
+            if (mainForm != null && !mainForm.IsDisposed &&
+                !string.Equals(mainForm.ContextPath, contextPath, StringComparison.OrdinalIgnoreCase))
+            {
+                MainForm previousForm = mainForm;
+                mainForm = null;
+                previousForm.Close();
+                previousForm.Dispose();
+            }
+
+            if (mainForm == null || mainForm.IsDisposed)
+            {
+                try
+                {
+                    mainForm = Program.CreateMainForm(appDirectory, configPath, usagePath, contextPath);
+                    mainForm.FormClosed += (sender, eventArgs) => mainForm = null;
+                }
+                catch (Exception exception)
+                {
+                    MessageBox.Show(
+                        "CLI List 无法打开：\n\n" + exception.Message,
+                        "CLI List",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error
+                    );
+                    return;
+                }
+            }
+
+            if (toggle && mainForm.Visible)
+            {
+                mainForm.Hide();
+                return;
+            }
+
+            if (!mainForm.Visible)
+            {
+                mainForm.Show();
+            }
+            if (mainForm.WindowState == FormWindowState.Minimized)
+            {
+                mainForm.WindowState = FormWindowState.Normal;
+            }
+            mainForm.Activate();
+            mainForm.BringToFront();
+        }
+
+        protected override void ExitThreadCore()
+        {
+            isExiting = true;
+            TryForwardToResident(string.Empty, false, 200);
+            if (pipeThread != null && pipeThread.IsAlive)
+            {
+                pipeThread.Join(500);
+            }
+
+            if (mainForm != null && !mainForm.IsDisposed)
+            {
+                MainForm closingForm = mainForm;
+                mainForm = null;
+                closingForm.Close();
+                closingForm.Dispose();
+            }
+
+            hotKeyWindow.Dispose();
+            trayIcon.Visible = false;
+            trayIcon.Dispose();
+            trayMenu.Dispose();
+            dispatcher.Dispose();
+            base.ExitThreadCore();
+        }
+    }
+
+    internal sealed class GlobalHotKeyWindow : NativeWindow, IDisposable
+    {
+        private const int HotKeyId = 0x434C;
+        private const int WmHotKey = 0x0312;
+        private const uint ModAlt = 0x0001;
+        private const uint ModControl = 0x0002;
+        private const uint ModNoRepeat = 0x4000;
+        private readonly Action onPressed;
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool RegisterHotKey(IntPtr windowHandle, int id, uint modifiers, uint virtualKey);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool UnregisterHotKey(IntPtr windowHandle, int id);
+
+        public GlobalHotKeyWindow(Action onPressed)
+        {
+            this.onPressed = onPressed;
+            CreateHandle(new CreateParams());
+            Registered = RegisterHotKey(Handle, HotKeyId, ModControl | ModAlt | ModNoRepeat, (uint)Keys.Space);
+        }
+
+        public bool Registered { get; private set; }
+
+        protected override void WndProc(ref Message message)
+        {
+            if (message.Msg == WmHotKey && message.WParam.ToInt32() == HotKeyId)
+            {
+                onPressed();
+            }
+            base.WndProc(ref message);
+        }
+
+        public void Dispose()
+        {
+            if (Registered)
+            {
+                UnregisterHotKey(Handle, HotKeyId);
+                Registered = false;
+            }
+            DestroyHandle();
+        }
+    }
+
     internal sealed class MainForm : Form
     {
         private readonly string appDirectory;
@@ -326,6 +646,8 @@ namespace CliListApp
         private ComboBox sortBox;
         private Label summaryLabel;
         private FlowLayoutPanel commandList;
+
+        internal string ContextPath { get { return contextPath; } }
 
         public MainForm(string appDirectory, string configPath, string contextPath, IList<CommandItem> commands, UsageTracker usageTracker)
         {

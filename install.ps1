@@ -14,13 +14,31 @@ if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Adm
 $installDirectory = Join-Path $env:USERPROFILE '.cli-list'
 $binDirectory = Join-Path $env:USERPROFILE 'bin'
 $desktopDirectory = [Environment]::GetFolderPath('Desktop')
+$startupDirectory = [Environment]::GetFolderPath('Startup')
 $executablePath = Join-Path $installDirectory 'CLIList.exe'
 $iconPath = Join-Path $installDirectory 'cli-list.ico'
 
 New-Item -ItemType Directory -Path $installDirectory -Force | Out-Null
 New-Item -ItemType Directory -Path $binDirectory -Force | Out-Null
 
-Copy-Item -LiteralPath (Join-Path $SourceDirectory 'CLIList.exe') -Destination $executablePath -Force
+$runningProcesses = Get-Process -Name 'CLIList' -ErrorAction SilentlyContinue
+if ($runningProcesses) {
+    $runningProcesses | Stop-Process -Force
+    $runningProcesses | Wait-Process -Timeout 5 -ErrorAction SilentlyContinue
+}
+
+for ($attempt = 1; $attempt -le 10; $attempt++) {
+    try {
+        Copy-Item -LiteralPath (Join-Path $SourceDirectory 'CLIList.exe') -Destination $executablePath -Force
+        break
+    }
+    catch {
+        if ($attempt -eq 10) {
+            throw
+        }
+        Start-Sleep -Milliseconds 300
+    }
+}
 Copy-Item -LiteralPath (Join-Path $SourceDirectory 'CLIList.cs') -Destination (Join-Path $installDirectory 'CLIList.cs') -Force
 Copy-Item -LiteralPath (Join-Path $SourceDirectory 'cli-list.ico') -Destination $iconPath -Force
 Copy-Item -LiteralPath (Join-Path $SourceDirectory 'cli-list.svg') -Destination (Join-Path $installDirectory 'cli-list.svg') -Force
@@ -75,7 +93,20 @@ $shortcut.Description = '打开 CLI List 命令面板'
 $shortcut.IconLocation = "$iconPath,0"
 $shortcut.Save()
 
+$residentShortcutPath = Join-Path $startupDirectory 'CLI List Resident.lnk'
+$residentShortcut = $shell.CreateShortcut($residentShortcutPath)
+$residentShortcut.TargetPath = $executablePath
+$residentShortcut.Arguments = '--resident'
+$residentShortcut.WorkingDirectory = $env:USERPROFILE
+$residentShortcut.Description = '启动 CLI List 托盘与全局快捷键'
+$residentShortcut.IconLocation = "$iconPath,0"
+$residentShortcut.WindowStyle = 7
+$residentShortcut.Save()
+
+Start-Process -FilePath $executablePath -ArgumentList '--resident'
+
 Write-Output "安装目录：$installDirectory"
 Write-Output "桌面入口：$shortcutPath"
 Write-Output "终端命令：cli-list"
+Write-Output '全局快捷键：Ctrl + Alt + Space'
 Write-Output '右键入口：CLI List（Windows 11 中可能位于“显示更多选项”）'
