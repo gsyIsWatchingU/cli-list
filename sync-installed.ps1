@@ -131,6 +131,8 @@ try {
         'gpu-trae.vbs',
         'skill-atlas-dev.cmd',
         'skill-atlas-dev.vbs',
+        'tool-desk-start.cmd',
+        'tool-desk-start.vbs',
         'sync-installed.ps1',
         'uninstall.ps1'
     )

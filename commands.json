@@ -58,6 +58,16 @@
     "CloseAfterLaunch": true
   },
   {
+    "Id": "start-tool-desk",
+    "Name": "一键启动 Tool Desk",
+    "Description": "以开发模式启动 Interview Copilot（tool-desk）桌面应用",
+    "Tags": ["开发", "工具", "面试"],
+    "Executable": "%SystemRoot%\\System32\\wscript.exe",
+    "Arguments": "//B \"%USERPROFILE%\\.cli-list\\tool-desk-start.vbs\"",
+    "WorkingDirectory": "E:\\prj-gsy\\tool-desk",
+    "CloseAfterLaunch": true
+  },
+  {
     "Id": "open-zotero",
     "Name": "打开 Zotero",
     "Description": "启动 Zotero 文献管理器",
