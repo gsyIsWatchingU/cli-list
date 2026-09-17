@@ -38,6 +38,14 @@
     "CloseAfterLaunch": true
   },
   {
+    "Id": "open-browser",
+    "Name": "打开浏览器",
+    "Description": "选择并打开本机已安装的浏览器",
+    "Tags": ["浏览器", "本地"],
+    "Action": "OpenBrowser",
+    "CloseAfterLaunch": false
+  },
+  {
     "Id": "open-vscode",
     "Name": "使用 VS Code 打开",
     "Description": "在当前目录启动 Visual Studio Code",
@@ -75,6 +83,16 @@
     "Executable": "%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs\\Zotero.lnk",
     "Arguments": "",
     "WorkingDirectory": "D:\\software\\Zotero",
+    "CloseAfterLaunch": true
+  },
+  {
+    "Id": "minimize-all-windows",
+    "Name": "最小化所有窗口",
+    "Description": "一键最小化所有窗口，直接显示桌面",
+    "Tags": ["系统", "窗口"],
+    "Executable": "%SystemRoot%\\System32\\wscript.exe",
+    "Arguments": "//B \"%USERPROFILE%\\.cli-list\\minimize-all.vbs\"",
+    "WorkingDirectory": "{context}",
     "CloseAfterLaunch": true
   }
 ]

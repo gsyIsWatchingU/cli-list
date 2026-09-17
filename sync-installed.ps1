@@ -129,6 +129,7 @@ try {
         'cli-list.svg',
         'commands.json',
         'gpu-trae.vbs',
+        'minimize-all.vbs',
         'skill-atlas-dev.cmd',
         'skill-atlas-dev.vbs',
         'tool-desk-start.cmd',
