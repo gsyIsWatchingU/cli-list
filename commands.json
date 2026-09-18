@@ -76,6 +76,16 @@
     "CloseAfterLaunch": true
   },
   {
+    "Id": "start-travel-test",
+    "Name": "一键启动差旅报销工具",
+    "Description": "构建并启动差旅报销判断工具（API + 结果页），自动避开占用端口并打开浏览器",
+    "Tags": ["开发", "工具", "面试"],
+    "Executable": "%SystemRoot%\\System32\\wscript.exe",
+    "Arguments": "//B \"%USERPROFILE%\\.cli-list\\travel-test-start.vbs\"",
+    "WorkingDirectory": "E:\\prj-gsy\\travel-test",
+    "CloseAfterLaunch": true
+  },
+  {
     "Id": "open-zotero",
     "Name": "打开 Zotero",
     "Description": "启动 Zotero 文献管理器",

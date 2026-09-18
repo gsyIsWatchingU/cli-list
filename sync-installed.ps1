@@ -134,6 +134,8 @@ try {
         'skill-atlas-dev.vbs',
         'tool-desk-start.cmd',
         'tool-desk-start.vbs',
+        'travel-test-start.cmd',
+        'travel-test-start.vbs',
         'sync-installed.ps1',
         'uninstall.ps1'
     )
