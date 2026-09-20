@@ -48,7 +48,7 @@ jobs:
           } else {
             $log = git log --oneline --no-merges -30
           }
-          @("## CLI List $tag", "", $log) | Set-Content -FilePath CHANGELOG.md -Encoding utf8
+          @("## CLI List $tag", "", $log) | Set-Content -Path CHANGELOG.md -Encoding utf8
 
       - name: 发布 GitHub Release
         env:
