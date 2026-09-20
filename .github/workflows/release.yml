@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 构建并验证
+        shell: pwsh
+        run: .\test.ps1 -SkipInstalledSync
+
+      - name: 打包 Release 压缩包
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path staging -Force | Out-Null
+          $files = @(
+            'CLIList.exe', 'cli-list.ico', 'cli-list.svg', 'commands.json',
+            'install.ps1', 'uninstall.ps1', 'sync-installed.ps1',
+            'cli-list.cmd', 'minimize-all.vbs', 'README.md', 'LICENSE'
+          )
+          foreach ($f in $files) {
+            if (Test-Path -LiteralPath $f) {
+              Copy-Item -LiteralPath $f -Destination staging
+            }
+          }
+          Compress-Archive -Path staging\* -DestinationPath "cli-list-$env:GITHUB_REF_NAME.zip"
+
+      - name: 生成变更说明
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $prev = git describe --tags --abbrev=0 HEAD^ 2>$null
+          if ($prev) {
+            $log = git log --oneline --no-merges "$prev..HEAD"
+          } else {
+            $log = git log --oneline --no-merges -30
+          }
+          @("## CLI List $tag", "", $log) | Set-Content -FilePath CHANGELOG.md -Encoding utf8
+
+      - name: 发布 GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" "cli-list-$env:GITHUB_REF_NAME.zip" --title "CLI List $env:GITHUB_REF_NAME" --notes-file CHANGELOG.md

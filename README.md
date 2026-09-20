@@ -1,6 +1,6 @@
 # CLI List
 
-CLI List 是一个面向 Windows 的轻量命令面板。它会在资源管理器右键菜单中添加 `CLI List`，让你从当前目录快速执行常用脚本、打开 PowerShell，或进入带文件预览的目录选择器。
+CLI List 是一个面向 Windows 的轻量命令面板。安装后即可从资源管理器右键菜单、全局快捷键或系统托盘使用，从当前目录快速执行常用脚本、打开 PowerShell，或进入带文件预览的目录选择器。
 
 ![CLI List 极简像素界面](assets/screenshot.png)
 
@@ -15,7 +15,7 @@ CLI List 是一个面向 Windows 的轻量命令面板。它会在资源管理�
 - 在当前目录直接启动 PowerShell 或其他 CLI。
 - 浏览目录并预览文本、代码与常见图片。
 - 提供桌面快捷方式和 `cli-list` 终端命令。
-- 首次安装后，执行 `git pull` 自动构建、校验并更新已安装程序。
+- 首次运行引导安装，无需管理员权限即可完成右键菜单与开机启动注册。
 - 使用极简像素风界面与多尺寸 Windows 图标。
 
 ## 技术栈
@@ -23,25 +23,33 @@ CLI List 是一个面向 Windows 的轻量命令面板。它会在资源管理�
 - C# / Windows Forms
 - PowerShell
 - .NET Framework 4.x 自带编译器
-- Windows 注册表 Shell 菜单
+- Windows 注册表 Shell 菜单（HKCU，无需管理员权限）
 
 ## 环境要求
 
 - Windows 10 或 Windows 11
-- Windows PowerShell 5.1 或 PowerShell 7
-- .NET Framework 4.x
-- Microsoft Edge（仅构建图标时使用）
+- .NET Framework 4.x（系统自带）
+- Microsoft Edge（仅源码方式构建图标时使用）
 
-## 快速开始
+## 安装
 
-以管理员身份打开 PowerShell，进入项目目录：
+### 方式一：下载即装（推荐）
+
+1. 从 [GitHub Releases](https://github.com/gsyIsWatchingU/cli-list/releases) 下载最新的 `cli-list-vX.Y.Z.zip`。
+2. 解压到任意目录，双击 `CLIList.exe`。
+3. 首次运行会弹出安装引导：确认后程序安装到 `%LOCALAPPDATA%\CLIList`，并自动注册右键菜单、全局快捷键、开机启动和桌面快捷方式。
+
+全程无需管理员权限。安装后可从任意位置使用；需要卸载时，右键托盘图标选择“卸载 CLI List”。
+
+### 方式二：源码安装（开发者）
+
+以普通权限打开 PowerShell，进入项目目录：
 
 ```powershell
-Set-ExecutionPolicy -Scope Process Bypass
 .\install.ps1
 ```
 
-安装脚本会自动构建和验证，无需提前执行其他命令。
+安装脚本会自动构建、验证，并注册当前用户的右键菜单与开机启动。
 
 安装完成后，可以通过以下入口启动：
 
@@ -50,9 +58,9 @@ Set-ExecutionPolicy -Scope Process Bypass
 - 双击桌面的 `CLI List` 快捷方式。
 - 在终端中执行 `cli-list`；如命令不可用，请将 `%USERPROFILE%\bin` 加入 `PATH`。
 
-安装脚本会创建开机启动项。关闭命令面板后程序仍驻留在系统托盘；需要完全退出时，右键托盘图标并选择“退出”。右键菜单或终端再次启动时，当前目录会传递给驻留进程。
+关闭命令面板后程序仍驻留在系统托盘；需要完全退出时，右键托盘图标并选择“退出”。右键菜单或终端再次启动时，当前目录会传递给驻留进程。
 
-程序安装到 `%USERPROFILE%\.cli-list`。首次安装后，其他设备更新到 GitHub 最新版本只需在各自仓库执行：
+源码方式安装到 `%USERPROFILE%\.cli-list`。首次安装后，其他设备更新到 GitHub 最新版本只需在各自仓库执行：
 
 ```powershell
 git pull --ff-only
@@ -68,7 +76,7 @@ git pull --ff-only
 
 ## 配置命令
 
-仓库中的 `commands.json` 是多端共享配置，推送后可随代码同步。本机专用命令写入 `%USERPROFILE%\.cli-list\commands.local.json`；同一 `Id` 会覆盖共享命令，新 `Id` 会追加命令，也可用 `Disabled` 隐藏共享命令。
+仓库中的 `commands.json` 是多端共享配置，推送后可随代码同步。本机专用命令写入 `%USERPROFILE%\.cli-list\commands.local.json`；同一 `Id` 会覆盖共享命令，新 `Id` 会追加命令，也可用 `Disabled` 隐藏共享命令。建议把带本机绝对路径或私有工具的命令放进 `commands.local.json`，共享配置只保留通用命令。
 
 普通命令示例：
 
@@ -94,16 +102,24 @@ git pull --ff-only
 }
 ```
 
-`{context}` 表示打开 CLI List 时所在的目录。内置动作 `BrowsePowerShell` 用于打开目录浏览与文件预览窗口。
+### 占位符
+
+`Executable`、`Arguments` 和 `WorkingDirectory` 支持以下占位符：
+
+| 占位符 | 含义 |
+| --- | --- |
+| `{context}` | 打开 CLI List 时所在的目录（原样替换） |
+| `{context:q}` | 同上，但自动用双引号包裹并转义内部引号，适合放入 `Arguments` |
+| `{appdir}` | CLI List 程序所在目录（原样替换） |
+| `{appdir:q}` | 同上，自动加双引号，适合引用安装目录内的辅助脚本 |
+
+内置动作 `BrowsePowerShell` 用于打开目录浏览与文件预览窗口；`OpenBrowser` 会列出本机已安装的浏览器供选择后启动。
 `Id` 用于关联使用统计，应保持唯一且不要随意修改；`Tags` 用于搜索和标签筛选。`commands.local.json`、迁移备份和统计数据只保存在本机，不会上传。
 
 ## 卸载
 
-以管理员身份运行：
-
-```powershell
-.\uninstall.ps1
-```
+- 下载即装：右键托盘图标 → “卸载 CLI List”。
+- 源码安装：在项目目录运行 `.\uninstall.ps1`（普通权限即可）。
 
 卸载会退出驻留进程，并移除右键菜单、桌面快捷方式、开机启动项和终端命令；配置目录仍会保留。
 

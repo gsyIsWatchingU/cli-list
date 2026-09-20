@@ -5,12 +5,6 @@
 
 $ErrorActionPreference = 'Stop'
 
-$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$currentPrincipal = [Security.Principal.WindowsPrincipal]::new($currentIdentity)
-if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw '安装右键菜单需要管理员权限，请以管理员身份运行 PowerShell。'
-}
-
 $installDirectory = Join-Path $env:USERPROFILE '.cli-list'
 $binDirectory = Join-Path $env:USERPROFILE 'bin'
 $desktopDirectory = [Environment]::GetFolderPath('Desktop')
@@ -52,24 +46,31 @@ function Install-ContextMenuEntry {
     Set-Item -LiteralPath $commandPath -Value ('"' + $executablePath + '" "' + $ContextPlaceholder + '"')
 }
 
-$legacyUserPaths = @(
+# 清理旧版本可能写入的 HKLM/HKCU 条目，避免重复菜单
+$legacyPaths = @(
+    'HKLM:\Software\Classes\Directory\Background\shell\CLIList',
+    'HKLM:\Software\Classes\Directory\shell\CLIList',
+    'HKLM:\Software\Classes\DesktopBackground\Shell\CLIList',
+    'HKLM:\Software\Classes\*\shell\CLIList',
+    'HKLM:\Software\Classes\Drive\shell\CLIList',
     'HKCU:\Software\Classes\Directory\Background\shell\CLIList',
     'HKCU:\Software\Classes\Directory\shell\CLIList',
     'HKCU:\Software\Classes\DesktopBackground\Shell\CLIList',
     'HKCU:\Software\Classes\*\shell\CLIList',
     'HKCU:\Software\Classes\Drive\shell\CLIList'
 )
-foreach ($legacyUserPath in $legacyUserPaths) {
-    if (Test-Path -LiteralPath $legacyUserPath) {
-        Remove-Item -LiteralPath $legacyUserPath -Recurse -Force
+foreach ($legacyPath in $legacyPaths) {
+    if (Test-Path -LiteralPath $legacyPath) {
+        Remove-Item -LiteralPath $legacyPath -Recurse -Force
     }
 }
 
-Install-ContextMenuEntry -RegistryPath 'HKLM:\Software\Classes\Directory\Background\shell\CLIList' -ContextPlaceholder '%V'
-Install-ContextMenuEntry -RegistryPath 'HKLM:\Software\Classes\Directory\shell\CLIList' -ContextPlaceholder '%1'
-Install-ContextMenuEntry -RegistryPath 'HKLM:\Software\Classes\DesktopBackground\Shell\CLIList' -ContextPlaceholder '%V'
-Install-ContextMenuEntry -RegistryPath 'HKLM:\Software\Classes\*\shell\CLIList' -ContextPlaceholder '%1'
-Install-ContextMenuEntry -RegistryPath 'HKLM:\Software\Classes\Drive\shell\CLIList' -ContextPlaceholder '%1'
+# 写入当前用户右键菜单（HKCU，无需管理员权限）
+Install-ContextMenuEntry -RegistryPath 'HKCU:\Software\Classes\Directory\Background\shell\CLIList' -ContextPlaceholder '%V'
+Install-ContextMenuEntry -RegistryPath 'HKCU:\Software\Classes\Directory\shell\CLIList' -ContextPlaceholder '%1'
+Install-ContextMenuEntry -RegistryPath 'HKCU:\Software\Classes\DesktopBackground\Shell\CLIList' -ContextPlaceholder '%V'
+Install-ContextMenuEntry -RegistryPath 'HKCU:\Software\Classes\*\shell\CLIList' -ContextPlaceholder '%1'
+Install-ContextMenuEntry -RegistryPath 'HKCU:\Software\Classes\Drive\shell\CLIList' -ContextPlaceholder '%1'
 
 $shortcutPath = Join-Path $desktopDirectory 'CLI List.lnk'
 $shell = New-Object -ComObject WScript.Shell

@@ -17,6 +17,14 @@ usage.json.tmp
 commands.local.json
 commands.pre-shared-migration.json
 
+# 开发备份与临时文件
+CLIList_backup.cs
+CLIList_full.cs
+dnd_code.txt
+save_method.txt
+show-only-screen1.bat
+*.bak
+
 # 编辑器与系统文件
 .vs/
 .vscode/

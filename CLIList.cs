@@ -1,20 +1,43 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
-using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.IO.Pipes;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+using Microsoft.Win32;
+
+[assembly: AssemblyTitle("CLI List")]
+[assembly: AssemblyProduct("CLI List")]
+[assembly: AssemblyVersion("0.1.0")]
+[assembly: AssemblyFileVersion("0.1.0")]
 
 namespace CliListApp
 {
+    internal static class AppInfo
+    {
+        public static string Version
+        {
+            get
+            {
+                Version version = Assembly.GetExecutingAssembly().GetName().Version;
+                return version == null ? "0.0.0" : version.ToString(3);
+            }
+        }
+
+        public static string DisplayName
+        {
+            get { return "CLI List v" + Version; }
+        }
+    }
+
     public sealed class CommandItem
     {
         public string Id { get; set; }
@@ -122,8 +145,9 @@ namespace CliListApp
             bool residentRequested = args.Any(value => string.Equals(value, "--resident", StringComparison.OrdinalIgnoreCase));
             string screenshotPath = GetOptionValue(args, "--screenshot");
             string browserScreenshotPath = GetOptionValue(args, "--screenshot-browser");
+            string browserPickerScreenshotPath = GetOptionValue(args, "--screenshot-browser-picker");
             string previewFilePath = GetOptionValue(args, "--preview-file");
-            bool automatedMode = validateOnly || !string.IsNullOrWhiteSpace(screenshotPath) || !string.IsNullOrWhiteSpace(browserScreenshotPath);
+            bool automatedMode = validateOnly || !string.IsNullOrWhiteSpace(screenshotPath) || !string.IsNullOrWhiteSpace(browserScreenshotPath) || !string.IsNullOrWhiteSpace(browserPickerScreenshotPath);
 
             try
             {
@@ -141,6 +165,11 @@ namespace CliListApp
                 string suppliedContext = GetContextArgument(args);
                 string contextPath = ResolveContextDirectory(suppliedContext);
 
+                if (Installer.TryEnsureInstalled(appDirectory, suppliedContext, residentRequested))
+                {
+                    return;
+                }
+
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
 
@@ -152,6 +181,13 @@ namespace CliListApp
                         browserForm.SelectFileForPreview(previewFilePath);
                     }
                     RenderScreenshot(browserForm, browserScreenshotPath);
+                    return;
+                }
+
+                if (!string.IsNullOrWhiteSpace(browserPickerScreenshotPath))
+                {
+                    var pickerForm = new BrowserPickerForm(appDirectory, contextPath);
+                    RenderScreenshot(pickerForm, browserPickerScreenshotPath);
                     return;
                 }
 
@@ -256,6 +292,12 @@ namespace CliListApp
                     continue;
                 }
 
+                if (string.Equals(args[index], "--screenshot-browser-picker", StringComparison.OrdinalIgnoreCase))
+                {
+                    index++;
+                    continue;
+                }
+
                 if (string.Equals(args[index], "--preview-file", StringComparison.OrdinalIgnoreCase))
                 {
                     index++;
@@ -285,7 +327,7 @@ namespace CliListApp
             using (var bitmap = new Bitmap(form.Width, form.Height))
             {
                 form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, form.Size));
-                bitmap.Save(fullOutputPath, ImageFormat.Png);
+                bitmap.Save(fullOutputPath, System.Drawing.Imaging.ImageFormat.Png);
             }
 
             form.Close();
@@ -317,6 +359,17 @@ namespace CliListApp
             List<CommandItem> localCommands = ReadCommands(localConfigPath, true);
             ValidateCommands(localCommands, true, Path.GetFileName(localConfigPath));
 
+            // 提取本地配置中的排序顺序（按出现顺序）
+            var localOrder = new List<string>();
+            var localSettings = new Dictionary<string, CommandItem>(StringComparer.OrdinalIgnoreCase);
+            foreach (CommandItem localCommand in localCommands)
+            {
+                string key = GetCommandKey(localCommand);
+                localOrder.Add(key);
+                localSettings[key] = localCommand;
+            }
+
+            // 应用本地配置的修改（覆盖/新增/禁用）
             foreach (CommandItem localCommand in localCommands)
             {
                 string localKey = GetCommandKey(localCommand);
@@ -343,6 +396,28 @@ namespace CliListApp
                 {
                     commands.Add(localCommand);
                 }
+            }
+
+            // 如果本地配置定义了排序顺序，按该顺序重排
+            if (localOrder.Count > 0)
+            {
+                var ordered = new List<CommandItem>();
+                var remaining = new List<CommandItem>(commands);
+
+                // 按本地排序顺序排列
+                foreach (string key in localOrder)
+                {
+                    int index = remaining.FindIndex(c => string.Equals(GetCommandKey(c), key, StringComparison.OrdinalIgnoreCase));
+                    if (index >= 0 && !remaining[index].Disabled)
+                    {
+                        ordered.Add(remaining[index]);
+                        remaining.RemoveAt(index);
+                    }
+                }
+
+                // 剩余未在排序中的命令追加到末尾
+                ordered.AddRange(remaining.Where(c => !c.Disabled));
+                commands = ordered;
             }
 
             ValidateCommands(commands, false, "合并后的命令配置");
@@ -415,7 +490,8 @@ namespace CliListApp
                     }
                 }
 
-                bool isBuiltInAction = string.Equals(command.Action, "BrowsePowerShell", StringComparison.OrdinalIgnoreCase);
+                bool isBuiltInAction = string.Equals(command.Action, "BrowsePowerShell", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(command.Action, "OpenBrowser", StringComparison.OrdinalIgnoreCase);
                 if (!command.Disabled && (string.IsNullOrWhiteSpace(command.Name) || (!isBuiltInAction && string.IsNullOrWhiteSpace(command.Executable))))
                 {
                     throw new InvalidDataException("每个命令都必须包含 Name，并提供 Executable 或受支持的 Action。 ");
@@ -520,11 +596,18 @@ namespace CliListApp
 
             var openItem = new ToolStripMenuItem("打开 CLI List    Ctrl+Alt+Space");
             openItem.Click += (sender, eventArgs) => ShowCommandPanel(null, false);
+            var versionItem = new ToolStripMenuItem(AppInfo.DisplayName);
+            versionItem.Enabled = false;
+            var uninstallItem = new ToolStripMenuItem("卸载 CLI List…");
+            uninstallItem.Click += (sender, eventArgs) => UninstallFromTray();
             var exitItem = new ToolStripMenuItem("退出");
             exitItem.Click += (sender, eventArgs) => ExitThread();
 
             trayMenu = new ContextMenuStrip();
             trayMenu.Items.Add(openItem);
+            trayMenu.Items.Add(versionItem);
+            trayMenu.Items.Add(new ToolStripSeparator());
+            trayMenu.Items.Add(uninstallItem);
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add(exitItem);
 
@@ -713,6 +796,33 @@ namespace CliListApp
             }
         }
 
+        private void UninstallFromTray()
+        {
+            DialogResult result = MessageBox.Show(
+                "确定要卸载 CLI List 吗？" + Environment.NewLine + Environment.NewLine +
+                "将移除右键菜单、开机启动和桌面快捷方式，并删除安装目录中的程序文件。",
+                "卸载 CLI List",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question
+            );
+            if (result != DialogResult.Yes)
+            {
+                return;
+            }
+
+            try
+            {
+                Installer.Uninstall();
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show("卸载失败：\n\n" + exception.Message, "卸载 CLI List", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            ExitThread();
+        }
+
         protected override void ExitThreadCore()
         {
             isExiting = true;
@@ -802,6 +912,17 @@ namespace CliListApp
         private ComboBox sortBox;
         private Label summaryLabel;
         private FlowLayoutPanel commandList;
+        private Panel commandListHost;
+        private VScrollBar commandScrollBar;
+        private bool scrolling;
+
+        // 拖动排序相关字段
+        private Control dragSourceHandle;
+        private Point dragStartPoint;
+        private bool isDragging;
+        private int dragInsertIndex = -1;
+        private Panel dragIndicator;
+
 
         internal string ContextPath { get { return contextPath; } }
 
@@ -810,10 +931,12 @@ namespace CliListApp
             this.appDirectory = appDirectory;
             this.configPath = configPath;
             this.contextPath = contextPath;
-            this.commands = commands;
+            // 应用保存的自定义排序
+            var orderedCommands = LoadCustomOrder(commands.ToList());
+            this.commands = orderedCommands;
             this.usageTracker = usageTracker;
 
-            Text = "CLI List";
+            Text = AppInfo.DisplayName;
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(660, 620);
             Size = new Size(720, 760);
@@ -969,8 +1092,6 @@ namespace CliListApp
                 DropDownStyle = ComboBoxStyle.DropDownList,
                 FlatStyle = FlatStyle.Flat,
                 DrawMode = DrawMode.OwnerDrawFixed,
-                // 下拉框总高度约为 ItemHeight + 6；20px 可完整落在 28px 内容区内，
-                // 避免原生控件覆盖外层 2px 底边框。
                 ItemHeight = 20,
                 Font = new Font("Microsoft YaHei UI", 9F),
                 BackColor = surface,
@@ -1026,20 +1147,55 @@ namespace CliListApp
             }
         }
 
+        // 命令列表 = 自绘滚动条（右） + FlowLayoutPanel（填充剩余宽度），用 TableLayoutPanel
+        // 左右分栏。之所以不用 FlowLayoutPanel.AutoScroll：WinForms 在 DPI 缩放或主题启用时
+        // 会改用视觉样式滚动条，其绘制完全不走控件窗口，会显现为一条空白竖槽（右侧那条白条）。
         private Control CreateCommandList()
         {
             commandList = new FlowLayoutPanel
             {
-                Dock = DockStyle.Fill,
+                Dock = DockStyle.Top,
                 BackColor = background,
                 FlowDirection = FlowDirection.TopDown,
                 WrapContents = false,
-                AutoScroll = true,
-                Padding = new Padding(0, 14, 6, 8)
+                AutoScroll = false,
+                Padding = new Padding(0, 14, 0, 8),
+                AllowDrop = true
             };
 
-            commandList.SizeChanged += (sender, eventArgs) => ResizeCommandCards();
-            return commandList;
+            commandList.SizeChanged += (sender, eventArgs) => OnCommandListSizeChanged();
+            commandList.DragOver += CommandList_DragOver;
+            commandList.DragDrop += CommandList_DragDrop;
+            commandList.DragLeave += (sender, eventArgs) => HideDragIndicator();
+            commandList.MouseWheel += CommandList_MouseWheel;
+
+            commandScrollBar = CreateCommandScrollBar();
+
+            commandListHost = new Panel
+            {
+                Dock = DockStyle.Fill,
+                Margin = Padding.Empty,
+                BackColor = background,
+                AutoScroll = false
+            };
+            commandListHost.Controls.Add(commandList);
+            commandListHost.SizeChanged += (sender, eventArgs) => ResizeCommandCards();
+            commandListHost.MouseWheel += CommandList_MouseWheel;
+
+            var host = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 2,
+                RowCount = 1,
+                Margin = Padding.Empty,
+                Padding = Padding.Empty
+            };
+            host.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            host.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, SystemInformation.VerticalScrollBarWidth + 2F));
+            host.Controls.Add(commandListHost, 0, 0);
+            host.Controls.Add(commandScrollBar, 1, 0);
+            return host;
         }
 
         private void RefreshCommandList()
@@ -1067,6 +1223,18 @@ namespace CliListApp
             commandList.SuspendLayout();
             commandList.Controls.Clear();
 
+            // 创建拖动指示线
+            dragIndicator = new Panel
+            {
+                Height = 3,
+                Width = CommandCardWidth(),
+                BackColor = accent,
+                Visible = false,
+                Margin = new Padding(0, 0, 0, 0)
+            };
+
+            bool allowDrag = sortBox.SelectedIndex == 0 && string.IsNullOrEmpty(query) && selectedTag == null;
+
             int commandIndex = 1;
             foreach (CommandItem command in visibleCommands)
             {
@@ -1079,16 +1247,17 @@ namespace CliListApp
                     usageText += "  ·  LAST " + lastUsed.ToLocalTime().ToString("MM-dd HH:mm");
                 }
 
+                // 放置顺序必须是「先内容、后手柄」：两者都是 Dock 填充，WinForms 按逆 z 序
+                // 排布填充控件，先加入者先占满整行，手柄会被挤到卡片之外（表现为手柄消失）。
                 var button = new Button
                 {
                     Tag = command,
-                    Text = "[" + commandIndex.ToString("00") + "]  " + command.Name + Environment.NewLine +
+                    Text = "  [" + commandIndex.ToString("00") + "]  " + command.Name + Environment.NewLine +
                            "      " + (command.Description ?? string.Empty) + Environment.NewLine +
                            "      " + tagText + "    " + usageText,
-                    Height = 88,
-                    Width = 608,
-                    Margin = new Padding(0, 0, 0, 12),
-                    Padding = new Padding(15, 0, 14, 0),
+                    Dock = DockStyle.Fill,
+                    Margin = Padding.Empty,
+                    Padding = new Padding(10, 0, 14, 0),
                     TextAlign = ContentAlignment.MiddleLeft,
                     ForeColor = textPrimary,
                     BackColor = surface,
@@ -1097,14 +1266,59 @@ namespace CliListApp
                     Cursor = Cursors.Hand,
                     UseVisualStyleBackColor = false
                 };
-                button.FlatAppearance.BorderColor = border;
-                button.FlatAppearance.BorderSize = 2;
+                button.FlatAppearance.BorderSize = 0;
                 button.FlatAppearance.MouseOverBackColor = surfaceHover;
                 button.FlatAppearance.MouseDownBackColor = accent;
-                button.MouseEnter += (sender, eventArgs) => ((Button)sender).BackColor = surfaceHover;
-                button.MouseLeave += (sender, eventArgs) => ((Button)sender).BackColor = surface;
                 button.Click += LaunchCommand;
-                commandList.Controls.Add(button);
+
+                // 左侧拖动手柄
+                var dragHandle = new Label
+                {
+                    Text = "⋮⋮",
+                    Dock = DockStyle.Left,
+                    Width = 26,
+                    Font = new Font("Consolas", 12F, FontStyle.Bold),
+                    ForeColor = textSecondary,
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    BackColor = Color.FromArgb(240, 240, 235),
+                    Cursor = allowDrag ? Cursors.SizeAll : Cursors.Default
+                };
+
+                // 创建命令卡片容器（带拖动手柄）
+                var cardPanel = new Panel
+                {
+                    Height = 88,
+                    Width = CommandCardWidth(),
+                    Margin = new Padding(0, 0, 0, 12),
+                    BackColor = surface,
+                    BorderStyle = BorderStyle.FixedSingle,
+                    Padding = new Padding(0)
+                };
+
+                // 手柄悬停效果
+                dragHandle.MouseEnter += (sender, e) => dragHandle.BackColor = surfaceHover;
+                dragHandle.MouseLeave += (sender, e) => dragHandle.BackColor = Color.FromArgb(240, 240, 235);
+
+                // 启用拖动排序（只在手柄上）
+                if (allowDrag)
+                {
+                    dragHandle.MouseDown += CommandButton_MouseDown;
+                    dragHandle.MouseMove += CommandButton_MouseMove;
+                    dragHandle.GiveFeedback += CommandButton_GiveFeedback;
+                    dragHandle.AllowDrop = true;
+                    dragHandle.DragOver += (s, e) => CommandList_DragOver(s, e);
+                    dragHandle.DragDrop += (s, e) => CommandList_DragDrop(s, e);
+                }
+
+                cardPanel.Controls.Add(button);
+                cardPanel.Controls.Add(dragHandle);
+
+                // 滚轮落在卡片上时转发给列表滚动条，否则鼠标停在卡片区域滚不动。
+                cardPanel.MouseWheel += ForwardMouseWheel;
+                button.MouseWheel += ForwardMouseWheel;
+                dragHandle.MouseWheel += ForwardMouseWheel;
+
+                commandList.Controls.Add(cardPanel);
                 commandIndex++;
             }
 
@@ -1113,7 +1327,7 @@ namespace CliListApp
                 commandList.Controls.Add(new Label
                 {
                     Text = "> 未找到匹配的 CLI\n  请调整关键词或标签筛选。",
-                    Width = 608,
+                    Width = CommandCardWidth(),
                     Height = 72,
                     Padding = new Padding(14, 16, 14, 0),
                     Margin = Padding.Empty,
@@ -1124,20 +1338,345 @@ namespace CliListApp
                 });
             }
 
-            // FlowLayoutPanel 在自动滚动时不会稳定保留最后一个控件的尾部 Margin。
-            // 使用独立占位控件扩展滚动范围，避免末项下边框紧贴底部操作栏。
+            // 末项与底部操作栏之间留白，避免下边框紧贴。
             commandList.Controls.Add(new Panel
             {
                 Height = 12,
-                Width = 608,
+                Width = CommandCardWidth(),
                 Margin = Padding.Empty,
                 BackColor = background
             });
             summaryLabel.Text = "SEARCH  名称 / 描述 / 标签    CLI  " + visibleCommands.Count + " / " + commands.Count +
                                 "    TOTAL RUN  " + commands.Sum(command => usageTracker.Get(command).Count);
             commandList.ResumeLayout();
+            UpdateCommandListHeight();
             ResizeCommandCards();
         }
+
+        // ============== 拖动排序实现 ==============
+
+        private void CommandButton_MouseDown(object sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Left)
+            {
+                dragSourceHandle = sender as Control;
+                dragStartPoint = e.Location;
+                isDragging = false;
+            }
+        }
+
+        private void CommandButton_MouseMove(object sender, MouseEventArgs e)
+        {
+            if (dragSourceHandle == null || e.Button != MouseButtons.Left)
+            {
+                return;
+            }
+
+            // 移动足够距离才开始拖动，避免误触
+            if (!isDragging)
+            {
+                if (Math.Abs(e.X - dragStartPoint.X) < 5 && Math.Abs(e.Y - dragStartPoint.Y) < 5)
+                {
+                    return;
+                }
+                isDragging = true;
+                // 拖动期间卡片会被改成无边框并加上内边距，控件尺寸随之变化（会从 88 掉到 3），
+                // 所以命中判断所需的高度与布局坐标必须在改样式之前先缓存下来。
+                CacheCommandCardLayout();
+                // 高亮整个卡片
+                var cardPanel = dragSourceHandle.Parent as Panel;
+                if (cardPanel != null)
+                {
+                    cardPanel.BackColor = Color.FromArgb(200, 215, 198);
+                    cardPanel.BorderStyle = BorderStyle.None;
+                    cardPanel.Padding = new Padding(2);
+                    cardPanel.Height = 88;   // 维持卡片高度，避免拖拽时列表整体跳动
+                }
+            }
+
+            // 执行拖放操作
+            DragDropEffects effect = dragSourceHandle.DoDragDrop(dragSourceHandle, DragDropEffects.Move);
+
+            // 拖动结束后恢复样式
+            if (effect == DragDropEffects.Move)
+            {
+                var cardPanel = dragSourceHandle.Parent as Panel;
+                if (cardPanel != null)
+                {
+                    cardPanel.BackColor = surface;
+                    cardPanel.BorderStyle = BorderStyle.FixedSingle;
+                    cardPanel.Padding = new Padding(0);
+                    cardPanel.Height = 88;
+                }
+            }
+
+            dragSourceHandle = null;
+            isDragging = false;
+            HideDragIndicator();
+        }
+
+        private void CommandList_DragOver(object sender, DragEventArgs e)
+        {
+            e.Effect = DragDropEffects.Move;
+
+            // 计算插入位置
+            Point pt = commandList.PointToClient(new Point(e.X, e.Y));
+            dragInsertIndex = GetInsertIndex(pt.Y);
+            ShowDragIndicator(dragInsertIndex);        }
+
+        private void CommandList_DragDrop(object sender, DragEventArgs e)
+        {
+            if (!e.Data.GetDataPresent(typeof(Control)))
+            {
+                return;
+            }
+
+            Control sourceHandle = (Control)e.Data.GetData(typeof(Control));
+            Panel sourceCard = sourceHandle.Parent as Panel;
+            Point pt = commandList.PointToClient(new Point(e.X, e.Y));
+            int targetIndex = GetInsertIndex(pt.Y);
+
+            // 获取源命令在当前列表中的索引
+            int sourceIndex = -1;
+            int cardIndex = 0;
+            foreach (Control ctrl in commandList.Controls)
+            {
+                if (ctrl is Panel && ((Panel)ctrl).Controls.Count >= 2)
+                {
+                    // 先加入的是内容按钮，Tag 是 CommandItem
+                    var btn = ((Panel)ctrl).Controls[0] as Button;
+                    if (btn != null && btn.Tag is CommandItem)
+                    {
+                        if (ctrl == sourceCard)
+                        {
+                            sourceIndex = cardIndex;
+                            break;
+                        }
+                        cardIndex++;
+                    }
+                }
+            }
+
+            if (sourceIndex < 0 || sourceIndex == targetIndex)
+            {
+                HideDragIndicator();
+                return;
+            }
+
+            // 调整目标索引（如果源在目标之前，需要减1）
+            if (sourceIndex < targetIndex)
+            {
+                targetIndex--;
+            }
+
+            // 执行移动
+            MoveCommand(sourceIndex, targetIndex);
+            HideDragIndicator();
+        }
+
+        private void CommandButton_GiveFeedback(object sender, GiveFeedbackEventArgs e)
+        {
+            e.UseDefaultCursors = true;
+        }
+
+        // 拖动前统一记录各卡片的布局 Top：列表本身会被滚动条整体上移（负数 Top），
+        // 命中判断必须用卡片的列表内坐标，不能直接用控件的 Top。
+        private readonly List<int> commandCardTops = new List<int>();
+        private readonly List<int> commandCardHeights = new List<int>();
+
+        private void CacheCommandCardLayout()
+        {
+            commandCardTops.Clear();
+            commandCardHeights.Clear();
+
+            if (commandList == null)
+            {
+                return;
+            }
+
+            int y = commandList.Padding.Top;
+            foreach (Control ctrl in commandList.Controls)
+            {
+                if (ctrl == dragIndicator) continue;
+                if (!(ctrl is Panel) || ((Panel)ctrl).BorderStyle != BorderStyle.FixedSingle) continue;
+                if (((Panel)ctrl).Controls.Count < 2) continue;
+
+                commandCardTops.Add(y);
+                commandCardHeights.Add(ctrl.Height);
+                y += ctrl.Height + ctrl.Margin.Bottom;
+            }
+        }
+
+        private int GetInsertIndex(double y)
+        {
+            for (int index = 0; index < commandCardTops.Count; index++)
+            {
+                if (y < commandCardTops[index] + commandCardHeights[index] / 2.0)
+                {
+                    return index;
+                }
+            }
+
+            return commandCardTops.Count;
+        }
+
+        private void ShowDragIndicator(int index)
+        {
+            if (dragIndicator == null) return;
+
+            // 移除已有的指示线
+            if (dragIndicator.Parent != null)
+            {
+                commandList.Controls.Remove(dragIndicator);
+            }
+
+            // 插入位置直接取缓存；越界（拖到列表末尾之后）时退化为「最后一张卡片的下沿」。
+            int y = commandList.Padding.Top;
+            if (commandCardTops.Count > 0)
+            {
+                if (index < commandCardTops.Count)
+                {
+                    y = commandCardTops[index];
+                }
+                else
+                {
+                    y = commandCardTops[commandCardTops.Count - 1] + commandCardHeights[commandCardHeights.Count - 1];
+                }
+            }
+            // 指示线用绝对值定位，不参与流式布局，所以宽度取可用内容宽度。
+            dragIndicator.Location = new Point(0, y - 2);
+            dragIndicator.Width = CommandCardWidth();
+            dragIndicator.Visible = true;
+            dragIndicator.BringToFront();
+            commandList.Controls.Add(dragIndicator);
+            dragIndicator.BringToFront();
+        }
+
+        private void HideDragIndicator()
+        {
+            dragInsertIndex = -1;
+            if (dragIndicator != null && dragIndicator.Parent != null)
+            {
+                dragIndicator.Visible = false;
+                commandList.Controls.Remove(dragIndicator);
+            }
+            commandCardTops.Clear();
+            commandCardHeights.Clear();
+        }
+
+        private void MoveCommand(int sourceIndex, int targetIndex)
+        {
+            if (sourceIndex == targetIndex) return;
+
+            // 从 commands 列表中移动项
+            var cmdList = commands.ToList();
+            CommandItem item = cmdList[sourceIndex];
+            cmdList.RemoveAt(sourceIndex);
+            cmdList.Insert(targetIndex, item);
+
+            // 更新 commands 列表
+            for (int i = 0; i < cmdList.Count; i++)
+            {
+                if (i < commands.Count)
+                {
+                    commands[i] = cmdList[i];
+                }
+            }
+
+            SaveCustomOrder(cmdList);
+            RefreshCommandList();
+        }
+
+        private void SaveCustomOrder(List<CommandItem> orderedCommands)
+        {
+            try
+            {
+                // 单独保存排序到 order.json，不修改命令配置
+                string orderPath = Path.Combine(Path.GetDirectoryName(configPath), "order.json");
+
+                // 只保存命令 Id 的顺序列表
+                List<string> orderIds = orderedCommands
+                    .Select(cmd => UsageTracker.GetKey(cmd))
+                    .ToList();
+
+                string json = new JavaScriptSerializer().Serialize(orderIds);
+                File.WriteAllText(orderPath, json, new UTF8Encoding(false));
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("保存排序失败：" + ex.Message, "CLI List", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private List<CommandItem> LoadCustomOrder(List<CommandItem> defaultCommands)
+        {
+            try
+            {
+                string orderPath = Path.Combine(Path.GetDirectoryName(configPath), "order.json");
+                if (!File.Exists(orderPath))
+                {
+                    return defaultCommands;
+                }
+
+                string json = File.ReadAllText(orderPath);
+                List<string> orderIds = new JavaScriptSerializer().Deserialize<List<string>>(json);
+                if (orderIds == null || orderIds.Count == 0)
+                {
+                    return defaultCommands;
+                }
+
+                var ordered = new List<CommandItem>();
+                var remaining = new List<CommandItem>(defaultCommands);
+
+                // 按 order.json 的顺序排列
+                foreach (string key in orderIds)
+                {
+                    int index = remaining.FindIndex(c =>
+                        string.Equals(UsageTracker.GetKey(c), key, StringComparison.OrdinalIgnoreCase));
+                    if (index >= 0)
+                    {
+                        ordered.Add(remaining[index]);
+                        remaining.RemoveAt(index);
+                    }
+                }
+
+                // 追加新增的命令
+                ordered.AddRange(remaining);
+                return ordered;
+            }
+            catch
+            {
+                return defaultCommands;
+            }
+        }
+
+        // ============== 拖动排序结束 ==============
+
+        // FlowLayoutPanel 每次改高度都会触发 SizeChanged，若直接在里面重新量高度会互相递归，
+        // 因此只在「宽度变化」时重排卡片与滚动条。
+        // 卡片按「扣掉滚动条之后的可用宽度」排布，滚动条才不会盖住卡片的右边框。
+        private int CommandCardWidth()
+        {
+            return Math.Max(360, _lastViewWidth - SystemInformation.VerticalScrollBarWidth);
+        }
+
+        private void OnCommandListSizeChanged()
+        {
+            if (commandList == null || commandListHost == null)
+            {
+                return;
+            }
+
+            if (commandList.Width == _lastCommandListWidth)
+            {
+                return;
+            }
+
+            _lastCommandListWidth = commandList.Width;
+            ResizeCommandCards();
+        }
+
+        private int _lastCommandListWidth = -1;
 
         private void ResizeCommandCards()
         {
@@ -1146,11 +1685,245 @@ namespace CliListApp
                 return;
             }
 
-            int width = Math.Max(360, commandList.ClientSize.Width - 14);
+            int viewWidth = commandListHost == null ? Math.Max(360, commandList.ClientSize.Width) : commandListHost.ClientSize.Width;
+            int viewHeight = commandListHost == null ? 0 : commandListHost.ClientSize.Height;
+
+            int containerWidth;
+            if (viewWidth > 0)
+            {
+                containerWidth = Math.Max(360, viewWidth - SystemInformation.VerticalScrollBarWidth);
+                _lastViewWidth = viewWidth;
+            }
+            else
+            {
+                // 首次布局完成前取不到宿主宽度，沿用上一次的实测值，避免卡片被压成 360。
+                viewWidth = _lastViewWidth;
+                containerWidth = Math.Max(360, viewWidth - SystemInformation.VerticalScrollBarWidth);
+            }
+
             foreach (Control control in commandList.Controls)
             {
-                control.Width = width;
+                // 卡片按「扣掉滚动条之后的可用宽度」排布，滚动条才不会盖住卡片的右边框。
+                bool isCommandCard = control is Panel && ((Panel)control).BorderStyle == BorderStyle.FixedSingle;
+                control.Width = isCommandCard ? containerWidth : viewWidth;
             }
+
+            UpdateCommandScrollBar(containerWidth, viewHeight);
+        }
+
+        private int _lastViewWidth = 560;
+
+        // 命令列表改用「外层 Panel 承载 + 自绘滚动条」后，滚动范围由自身高度决定：
+        // FlowLayoutPanel 内容随项增减，高度按子项实测高度累加；外层 Panel 只做视口。
+        private void UpdateCommandListHeight()
+        {
+            if (commandList == null)
+            {
+                return;
+            }
+
+            int contentHeight = commandList.Padding.Top + commandList.Padding.Bottom;
+            foreach (Control control in commandList.Controls)
+            {
+                if (control == dragIndicator)
+                {
+                    continue; // 指示线绝对定位，不占流式布局高度。
+                }
+                contentHeight += control.Height + control.Margin.Bottom + control.Margin.Top;
+            }
+
+            int minimumHeight = commandListHost == null ? 0 : commandListHost.ClientSize.Height;
+            commandList.AutoSize = false;
+            commandList.Height = Math.Max(1, Math.Max(contentHeight, minimumHeight));
+        }
+
+        private void UpdateCommandScrollBar()
+        {
+            UpdateCommandScrollBar(
+                Math.Max(360, (commandListHost == null ? 0 : commandListHost.ClientSize.Width) - SystemInformation.VerticalScrollBarWidth),
+                commandListHost == null ? 0 : commandListHost.ClientSize.Height
+            );
+        }
+
+        private void UpdateCommandScrollBar(int viewportWidth, int viewportHeight)
+        {
+            if (commandScrollBar == null || commandListHost == null)
+            {
+                return;
+            }
+
+            int contentHeight = commandList.Height;
+            int maxScroll = Math.Max(0, contentHeight - viewportHeight);
+
+            scrolling = true;
+            try
+            {
+                commandScrollBar.LargeChange = Math.Max(1, viewportHeight);
+                commandScrollBar.SmallChange = 30;
+                commandScrollBar.Maximum = maxScroll;
+                // 内容变短时把位置夹回合法范围，否则滑块会画出可视区之外。
+                commandScrollBar.Value = Math.Min(commandScrollBar.Value, maxScroll);
+                commandList.Top = -commandScrollBar.Value;
+            }
+            finally
+            {
+                scrolling = false;
+            }
+
+            PlaceCommandScrollBar();
+            UpdateCommandScrollBarVisibility();
+        }
+
+        private void PlaceCommandScrollBar()
+        {
+            if (commandScrollBar == null || commandScrollBar.Parent == null)
+            {
+                return;
+            }
+
+            int right = commandScrollBar.Parent.ClientSize.Width - commandScrollBar.Width;
+            int trackHeight = Math.Max(60, commandScrollBar.Parent.ClientSize.Height - 16);
+            commandScrollBar.Bounds = new Rectangle(right, 8, commandScrollBar.Width, trackHeight);
+        }
+
+        private void UpdateCommandScrollBarVisibility()
+        {
+            if (commandScrollBar == null || commandListHost == null)
+            {
+                return;
+            }
+
+            commandScrollBar.Visible = commandList.Height > commandListHost.ClientSize.Height;
+        }
+
+        private VScrollBar CreateCommandScrollBar()
+        {
+            var bar = new DrawerScrollBar
+            {
+                Minimum = 0,
+                Maximum = 0,
+                SmallChange = 30,
+                Width = SystemInformation.VerticalScrollBarWidth,
+                TabStop = false,
+                Visible = false
+            };
+            bar.ValueChanged += (sender, eventArgs) => ScrollCommandList(bar.Value);
+            return bar;
+        }
+
+        // 自绘滚动条：WinForms 原生的 VScrollBar 无法按应用配色改（必须注册非主题子控件，
+        // 代价是滑块被画成刺眼的纯白，也就是那条白条）。这里自己画轨道与滑块，
+        // 保持与卡片一致的浅色墨线语言。
+        private sealed class DrawerScrollBar : VScrollBar
+        {
+            private readonly Color trackColor = Color.FromArgb(237, 239, 232);
+            private readonly Color thumbColor = Color.FromArgb(196, 205, 196);
+            private readonly Color thumbHoverColor = Color.FromArgb(151, 179, 155);
+
+            private bool hovering;
+
+            public DrawerScrollBar()
+            {
+                SetStyle(
+                    ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw,
+                    true
+                );
+            }
+
+            protected override void OnMouseEnter(EventArgs eventArgs)
+            {
+                hovering = true;
+                Invalidate();
+                base.OnMouseEnter(eventArgs);
+            }
+
+            protected override void OnMouseLeave(EventArgs eventArgs)
+            {
+                hovering = false;
+                Invalidate();
+                base.OnMouseLeave(eventArgs);
+            }
+
+            protected override void OnPaint(PaintEventArgs eventArgs)
+            {
+                Graphics graphics = eventArgs.Graphics;
+                graphics.Clear(Parent == null ? trackColor : Parent.BackColor);
+
+                var track = new Rectangle(0, 0, Width, Height);
+                using (var trackBrush = new SolidBrush(trackColor))
+                {
+                    graphics.FillRectangle(trackBrush, track);
+                }
+
+                Rectangle thumb = GetThumbRectangle();
+                using (var thumbBrush = new SolidBrush(hovering ? thumbHoverColor : thumbColor))
+                {
+                    graphics.FillRectangle(thumbBrush, thumb);
+                }
+            }
+
+            private Rectangle GetThumbRectangle()
+            {
+                int channelHeight = Math.Max(1, Height);
+                int minimumThumb = 28;
+                int visible = Math.Max(1, LargeChange);
+                int range = visible + Math.Max(0, Maximum);
+                int thumbHeight = Math.Max(minimumThumb, (int)Math.Round((double)channelHeight * visible / range));
+                thumbHeight = Math.Min(thumbHeight, channelHeight);
+
+                int scrollable = Math.Max(1, channelHeight - thumbHeight);
+                int positionRange = Math.Max(1, Maximum);
+                int offset = (int)Math.Round((double)Math.Min(Value, positionRange) / positionRange * scrollable);
+
+                return new Rectangle(1, Math.Min(offset, channelHeight - thumbHeight), Math.Max(1, Width - 2), thumbHeight);
+            }
+        }
+
+        private void ScrollCommandList(int value)
+        {
+            if (commandList == null || scrolling)
+            {
+                return;
+            }
+
+            scrolling = true;
+            try
+            {
+                commandList.Top = -value;
+            }
+            finally
+            {
+                scrolling = false;
+            }
+        }
+
+        private void CommandList_MouseWheel(object sender, MouseEventArgs eventArgs)
+        {
+            ScrollCommandListBy(-eventArgs.Delta / 120 * 60);
+        }
+
+        // 滚轮落在卡片按钮/手柄上时，也转发给同一个滚动条，否则鼠标停在卡片上滚不动。
+        private void ForwardMouseWheel(object sender, MouseEventArgs eventArgs)
+        {
+            ScrollCommandListBy(-eventArgs.Delta / 120 * 60);
+        }
+
+        private void ScrollCommandListBy(int delta)
+        {
+            if (commandScrollBar == null || !commandScrollBar.Visible)
+            {
+                return;
+            }
+
+            int minimum = commandScrollBar.Minimum;
+            int maximum = Math.Max(minimum, commandScrollBar.Maximum - commandScrollBar.LargeChange + 1);
+            int next = Math.Max(minimum, Math.Min(maximum, commandScrollBar.Value + delta));
+            if (next == commandScrollBar.Value)
+            {
+                return;
+            }
+
+            commandScrollBar.Value = next;
         }
 
         private static bool MatchesSearch(CommandItem command, string query)
@@ -1271,9 +2044,23 @@ namespace CliListApp
                     return;
                 }
 
+                if (string.Equals(command.Action, "OpenBrowser", StringComparison.OrdinalIgnoreCase))
+                {
+                    usageTracker.Record(command);
+                    RefreshCommandList();
+                    using (var picker = new BrowserPickerForm(appDirectory, contextPath))
+                    {
+                        picker.ShowDialog(this);
+                    }
+                    return;
+                }
+
                 string executable = ResolveExecutable(command.Executable);
                 string workingDirectory = ResolveWorkingDirectory(command.WorkingDirectory);
                 string arguments = Environment.ExpandEnvironmentVariables(command.Arguments ?? string.Empty)
+                    .Replace("{appdir:q}", QuoteContextPath(appDirectory))
+                    .Replace("{appdir}", appDirectory)
+                    .Replace("{context:q}", QuoteContextPath(contextPath))
                     .Replace("{context}", contextPath);
 
                 var startInfo = new ProcessStartInfo
@@ -1329,6 +2116,379 @@ namespace CliListApp
             }
 
             return Directory.Exists(expanded) ? expanded : contextPath;
+        }
+
+        private static string QuoteContextPath(string contextPath)
+        {
+            return "\"" + contextPath.Replace("\"", "\\\"") + "\"";
+        }
+    }
+
+    internal sealed class BrowserPickerForm : Form
+    {
+        private readonly Color background = Color.FromArgb(244, 245, 239);
+        private readonly Color surface = Color.FromArgb(255, 255, 252);
+        private readonly Color surfaceHover = Color.FromArgb(226, 235, 224);
+        private readonly Color border = Color.FromArgb(23, 28, 24);
+        private readonly Color textPrimary = Color.FromArgb(23, 28, 24);
+        private readonly Color textSecondary = Color.FromArgb(91, 102, 94);
+        private readonly Color accent = Color.FromArgb(151, 179, 155);
+
+        private Label statusLabel;
+
+        public BrowserPickerForm(string appDirectory, string contextPath)
+        {
+            Text = "打开浏览器";
+            StartPosition = FormStartPosition.CenterParent;
+            MinimumSize = new Size(560, 420);
+            Size = new Size(680, 560);
+            BackColor = background;
+            ForeColor = textPrimary;
+            Font = new Font("Consolas", 9F, FontStyle.Regular, GraphicsUnit.Point);
+            AutoScaleMode = AutoScaleMode.Dpi;
+
+            string iconPath = Path.Combine(appDirectory, "cli-list.ico");
+            if (File.Exists(iconPath))
+            {
+                Icon = new Icon(iconPath);
+            }
+
+            Controls.Add(CreateLayout(contextPath));
+        }
+
+        private Control CreateLayout(string contextPath)
+        {
+            var root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 1,
+                RowCount = 3,
+                Padding = new Padding(20)
+            };
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 58F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 56F));
+            root.Controls.Add(CreateHeader(contextPath), 0, 0);
+            root.Controls.Add(CreateBrowserList(), 0, 1);
+            root.Controls.Add(CreateFooter(), 0, 2);
+            return root;
+        }
+
+        private Control CreateHeader(string contextPath)
+        {
+            var header = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 1,
+                RowCount = 2,
+                Margin = new Padding(0, 0, 0, 8)
+            };
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            header.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
+            header.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+
+            var title = new Label
+            {
+                Text = "[ BROWSER ]  选择要打开的浏览器",
+                Dock = DockStyle.Fill,
+                ForeColor = textPrimary,
+                BackColor = accent,
+                Font = new Font("Consolas", 11F, FontStyle.Bold),
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(10, 0, 0, 0)
+            };
+
+            var contextLabel = new Label
+            {
+                Text = "当前目录： " + (string.IsNullOrWhiteSpace(contextPath) ? "（无）" : contextPath),
+                Dock = DockStyle.Fill,
+                ForeColor = textSecondary,
+                Font = new Font("Consolas", 8.5F),
+                TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                Padding = new Padding(2, 0, 0, 0)
+            };
+
+            header.Controls.Add(title, 0, 0);
+            header.Controls.Add(contextLabel, 0, 1);
+            return header;
+        }
+
+        private Control CreateBrowserList()
+        {
+            List<BrowserInfo> browsers = DetectBrowsers();
+
+            var listPanel = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoScroll = true,
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                BackColor = background,
+                Padding = new Padding(0, 4, 8, 4)
+            };
+
+            if (browsers.Count == 0)
+            {
+                listPanel.Controls.Add(new Label
+                {
+                    Text = "未检测到已安装的浏览器。",
+                    AutoSize = true,
+                    ForeColor = textSecondary,
+                    Font = new Font("Consolas", 10F),
+                    Padding = new Padding(8, 16, 8, 8)
+                });
+                return listPanel;
+            }
+
+            foreach (BrowserInfo browser in browsers)
+            {
+                listPanel.Controls.Add(CreateBrowserButton(browser));
+            }
+            return listPanel;
+        }
+
+        private Button CreateBrowserButton(BrowserInfo browser)
+        {
+            var button = new Button
+            {
+                Tag = browser,
+                Width = 560,
+                Height = 62,
+                Margin = new Padding(2, 3, 2, 3),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = surface,
+                ForeColor = textPrimary,
+                Text = browser.Name + "\r\n" + browser.ExecutablePath,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = new Font("Consolas", 9F, FontStyle.Bold),
+                Cursor = Cursors.Hand,
+                UseVisualStyleBackColor = false
+            };
+            button.FlatAppearance.BorderColor = border;
+            button.FlatAppearance.BorderSize = 2;
+            button.FlatAppearance.MouseOverBackColor = surfaceHover;
+            button.MouseEnter += (sender, eventArgs) => ((Button)sender).BackColor = surfaceHover;
+            button.MouseLeave += (sender, eventArgs) => ((Button)sender).BackColor = surface;
+            button.Click += (sender, eventArgs) => LaunchBrowser(browser);
+            return button;
+        }
+
+        private Control CreateFooter()
+        {
+            var footer = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 2,
+                RowCount = 1,
+                Padding = new Padding(0, 10, 0, 0)
+            };
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100F));
+
+            statusLabel = new Label
+            {
+                Dock = DockStyle.Fill,
+                ForeColor = textSecondary,
+                Font = new Font("Consolas", 8.5F, FontStyle.Regular),
+                TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                AutoSize = false,
+                Padding = new Padding(4, 0, 0, 4),
+                Text = "检测到 " + DetectBrowsers().Count + " 个浏览器，点击即可启动。"
+            };
+
+            var cancelButton = new Button
+            {
+                Text = "[关闭]",
+                Dock = DockStyle.Fill,
+                Height = 38,
+                Margin = new Padding(4),
+                ForeColor = textPrimary,
+                BackColor = surface,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Consolas", 9F, FontStyle.Bold),
+                Cursor = Cursors.Hand,
+                UseVisualStyleBackColor = false
+            };
+            cancelButton.FlatAppearance.BorderColor = border;
+            cancelButton.FlatAppearance.BorderSize = 2;
+            cancelButton.FlatAppearance.MouseOverBackColor = surfaceHover;
+            cancelButton.FlatAppearance.MouseDownBackColor = accent;
+            cancelButton.Click += (sender, eventArgs) => Close();
+
+            footer.Controls.Add(statusLabel, 0, 0);
+            footer.Controls.Add(cancelButton, 1, 0);
+            return footer;
+        }
+
+        private void LaunchBrowser(BrowserInfo browser)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = browser.ExecutablePath,
+                    UseShellExecute = true
+                });
+                Close();
+            }
+            catch (Exception exception)
+            {
+                statusLabel.Text = "启动失败：" + exception.Message;
+            }
+        }
+
+        internal static List<BrowserInfo> DetectBrowsers()
+        {
+            var browsers = new Dictionary<string, BrowserInfo>(StringComparer.OrdinalIgnoreCase);
+
+            AddRegistryBrowsers(browsers, Registry.LocalMachine, @"SOFTWARE\Clients\StartMenuInternet");
+            AddRegistryBrowsers(browsers, Registry.LocalMachine, @"SOFTWARE\WOW6432Node\Clients\StartMenuInternet");
+            AddRegistryBrowsers(browsers, Registry.CurrentUser, @"SOFTWARE\Clients\StartMenuInternet");
+
+            AddCandidate(browsers, "Microsoft Edge", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"Microsoft\Edge\Application\msedge.exe"));
+            AddCandidate(browsers, "Microsoft Edge", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"Microsoft\Edge\Application\msedge.exe"));
+            AddCandidate(browsers, "Google Chrome", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"Google\Chrome\Application\chrome.exe"));
+            AddCandidate(browsers, "Google Chrome", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"Google\Chrome\Application\chrome.exe"));
+            AddCandidate(browsers, "Mozilla Firefox", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"Mozilla Firefox\firefox.exe"));
+            AddCandidate(browsers, "Mozilla Firefox", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"Mozilla Firefox\firefox.exe"));
+            AddCandidate(browsers, "Opera", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"Opera\opera.exe"));
+            AddCandidate(browsers, "Brave", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"BraveSoftware\Brave-Browser\Application\brave.exe"));
+            AddCandidate(browsers, "360 安全浏览器", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"360\360se6\Application\360se.exe"));
+            AddCandidate(browsers, "360 极速浏览器", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"360\360Chrome\Chrome\Application\360chrome.exe"));
+            AddCandidate(browsers, "QQ 浏览器", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"Tencent\QQBrowser\QQBrowser.exe"));
+            AddCandidate(browsers, "搜狗高速浏览器", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), @"SogouExplorer\SogouExplorer.exe"));
+
+            return browsers.Values
+                .Where(browser => File.Exists(browser.ExecutablePath))
+                .OrderBy(browser => browser.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private static void AddRegistryBrowsers(Dictionary<string, BrowserInfo> browsers, RegistryKey root, string subPath)
+        {
+            using (RegistryKey clientsKey = root.OpenSubKey(subPath))
+            {
+                if (clientsKey == null)
+                {
+                    return;
+                }
+
+                foreach (string browserKeyName in clientsKey.GetSubKeyNames())
+                {
+                    using (RegistryKey browserKey = clientsKey.OpenSubKey(browserKeyName))
+                    {
+                        if (browserKey == null)
+                        {
+                            continue;
+                        }
+
+                        string command = null;
+                        using (RegistryKey commandKey = browserKey.OpenSubKey(@"shell\open\command"))
+                        {
+                            if (commandKey != null)
+                            {
+                                command = commandKey.GetValue(null) as string;
+                            }
+                        }
+
+                        string exePath = ParseExecutablePath(command);
+                        if (string.IsNullOrEmpty(exePath) || !File.Exists(exePath))
+                        {
+                            continue;
+                        }
+
+                        AddUnique(browsers, GetBrowserDisplayName(browserKey, browserKeyName), exePath);
+                    }
+                }
+            }
+        }
+
+        private static string GetBrowserDisplayName(RegistryKey browserKey, string fallbackName)
+        {
+            string displayName = browserKey.GetValue(null) as string;
+            if (!string.IsNullOrWhiteSpace(displayName) && !displayName.StartsWith("@", StringComparison.Ordinal))
+            {
+                return displayName;
+            }
+
+            int dashIndex = fallbackName.LastIndexOf('-');
+            if (dashIndex > 0 && dashIndex < fallbackName.Length - 1 && IsHexSuffix(fallbackName, dashIndex + 1))
+            {
+                return fallbackName.Substring(0, dashIndex);
+            }
+            return fallbackName;
+        }
+
+        private static bool IsHexSuffix(string text, int startIndex)
+        {
+            for (int index = startIndex; index < text.Length; index++)
+            {
+                if (!Uri.IsHexDigit(text[index]))
+                {
+                    return false;
+                }
+            }
+            return text.Length - startIndex == 8 || text.Length - startIndex == 16;
+        }
+
+        private static string ParseExecutablePath(string command)
+        {
+            if (string.IsNullOrWhiteSpace(command))
+            {
+                return null;
+            }
+
+            string trimmed = command.Trim();
+            if (trimmed.StartsWith("\"", StringComparison.Ordinal))
+            {
+                int endQuote = trimmed.IndexOf('"', 1);
+                if (endQuote > 0)
+                {
+                    return Environment.ExpandEnvironmentVariables(trimmed.Substring(1, endQuote - 1));
+                }
+            }
+
+            int exeIndex = trimmed.IndexOf(".exe", StringComparison.OrdinalIgnoreCase);
+            if (exeIndex < 0)
+            {
+                return null;
+            }
+            int start = trimmed.LastIndexOf(' ', exeIndex);
+            int end = trimmed.IndexOf(' ', exeIndex);
+            if (end < 0)
+            {
+                end = trimmed.Length;
+            }
+            return Environment.ExpandEnvironmentVariables(trimmed.Substring(start + 1, end - start - 1).Trim('"'));
+        }
+
+        private static void AddCandidate(Dictionary<string, BrowserInfo> browsers, string name, string path)
+        {
+            if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+            {
+                AddUnique(browsers, name, path);
+            }
+        }
+
+        private static void AddUnique(Dictionary<string, BrowserInfo> browsers, string name, string exePath)
+        {
+            string fullPath = Path.GetFullPath(exePath);
+            if (!browsers.ContainsKey(fullPath))
+            {
+                browsers[fullPath] = new BrowserInfo { Name = name, ExecutablePath = fullPath };
+            }
+        }
+
+        internal sealed class BrowserInfo
+        {
+            public string Name { get; set; }
+            public string ExecutablePath { get; set; }
         }
     }
 
@@ -1840,6 +3000,12 @@ namespace CliListApp
         private void ShowImagePreview(string path)
         {
             DisposePreviewImage();
+            var previewFile = new FileInfo(path);
+            if (previewFile.Length > 20L * 1024 * 1024)
+            {
+                ShowPreviewMessage("图片超过 20MB，已跳过预览。\n\n路径：" + path);
+                return;
+            }
             using (Image source = Image.FromFile(path))
             {
                 imagePreview.Image = new Bitmap(source);
@@ -1904,4 +3070,353 @@ namespace CliListApp
             return unit == 0 ? size.ToString("0") + " " + units[unit] : size.ToString("0.##") + " " + units[unit];
         }
     }
+
+    internal static class Installer
+    {
+        private const string RegistryKeyPath = @"Software\CliListApp";
+        private const string InstalledValueName = "InstalledPath";
+
+        private static readonly string InstallDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "CLIList"
+        );
+
+        private static readonly string[] ContextMenuPaths = new[]
+        {
+            @"Software\Classes\Directory\Background\shell\CLIList",
+            @"Software\Classes\Directory\shell\CLIList",
+            @"Software\Classes\DesktopBackground\Shell\CLIList",
+            @"Software\Classes\*\shell\CLIList",
+            @"Software\Classes\Drive\shell\CLIList"
+        };
+
+        // 返回 true 表示引导流程已处理（已完成安装并转交新进程），调用方应直接退出当前进程。
+        public static bool TryEnsureInstalled(string appDirectory, string contextArgument, bool residentRequested)
+        {
+            // 后台驻留模式（开机启动/托盘重启）不弹安装引导。
+            if (residentRequested || IsInstalled())
+            {
+                return false;
+            }
+
+            using (var form = new BootstrapperForm(InstallDirectory))
+            {
+                if (form.ShowDialog() != DialogResult.Yes)
+                {
+                    return false;
+                }
+            }
+
+            try
+            {
+                Install(appDirectory);
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show(
+                    "安装失败：\n\n" + exception.Message,
+                    "CLI List",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error
+                );
+                return false;
+            }
+
+            string installedExecutable = Path.Combine(InstallDirectory, "CLIList.exe");
+            var launchArguments = new List<string>();
+            if (residentRequested)
+            {
+                launchArguments.Add("--resident");
+            }
+            else if (!string.IsNullOrWhiteSpace(contextArgument))
+            {
+                launchArguments.Add("\"" + contextArgument.Trim('"') + "\"");
+            }
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = installedExecutable,
+                Arguments = string.Join(" ", launchArguments),
+                WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                UseShellExecute = true
+            });
+            return true;
+        }
+
+        public static bool IsInstalled()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RegistryKeyPath))
+                {
+                    if (key == null)
+                    {
+                        return false;
+                    }
+
+                    string installedPath = key.GetValue(InstalledValueName) as string;
+                    return !string.IsNullOrWhiteSpace(installedPath) && File.Exists(installedPath);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static void Install(string sourceDirectory)
+        {
+            Directory.CreateDirectory(InstallDirectory);
+
+            foreach (string fileName in new[] { "CLIList.exe", "cli-list.ico", "cli-list.svg", "commands.json", "minimize-all.vbs" })
+            {
+                string sourcePath = Path.Combine(sourceDirectory, fileName);
+                if (File.Exists(sourcePath))
+                {
+                    File.Copy(sourcePath, Path.Combine(InstallDirectory, fileName), true);
+                }
+            }
+
+            string executablePath = Path.Combine(InstallDirectory, "CLIList.exe");
+            string iconPath = Path.Combine(InstallDirectory, "cli-list.ico");
+
+            foreach (string contextPath in ContextMenuPaths)
+            {
+                using (RegistryKey shellKey = Registry.CurrentUser.CreateSubKey(contextPath))
+                {
+                    if (shellKey == null)
+                    {
+                        continue;
+                    }
+
+                    shellKey.SetValue(null, "CLI List");
+                    if (File.Exists(iconPath))
+                    {
+                        shellKey.SetValue("Icon", iconPath);
+                    }
+
+                    bool isBackground = contextPath.Contains(@"Directory\Background") || contextPath.Contains("DesktopBackground");
+                    string placeholder = isBackground ? "%V" : "%1";
+                    using (RegistryKey commandKey = shellKey.CreateSubKey("command"))
+                    {
+                        if (commandKey != null)
+                        {
+                            commandKey.SetValue(null, "\"" + executablePath + "\" \"" + placeholder + "\"");
+                        }
+                    }
+                }
+            }
+
+            CreateShortcut(
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "CLI List Resident.lnk"),
+                executablePath,
+                "--resident",
+                "启动 CLI List 托盘与全局快捷键"
+            );
+            CreateShortcut(
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "CLI List.lnk"),
+                executablePath,
+                string.Empty,
+                "打开 CLI List 命令面板"
+            );
+
+            using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryKeyPath))
+            {
+                if (key != null)
+                {
+                    key.SetValue(InstalledValueName, executablePath);
+                }
+            }
+        }
+
+        public static void Uninstall()
+        {
+            foreach (string contextPath in ContextMenuPaths)
+            {
+                Registry.CurrentUser.DeleteSubKeyTree(contextPath, false);
+            }
+
+            RemoveShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "CLI List Resident.lnk"));
+            RemoveShortcut(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "CLI List.lnk"));
+
+            Registry.CurrentUser.DeleteSubKeyTree(RegistryKeyPath, false);
+
+            try
+            {
+                if (Directory.Exists(InstallDirectory))
+                {
+                    Directory.Delete(InstallDirectory, true);
+                }
+            }
+            catch
+            {
+                // 安装目录可能正被占用，留给用户手动清理。
+            }
+        }
+
+        private static void CreateShortcut(string shortcutPath, string targetPath, string arguments, string description)
+        {
+            try
+            {
+                Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+                if (shellType == null)
+                {
+                    return;
+                }
+
+                object shell = Activator.CreateInstance(shellType);
+                object shortcut = shell.GetType().InvokeMember(
+                    "CreateShortcut",
+                    BindingFlags.InvokeMethod,
+                    null,
+                    shell,
+                    new object[] { shortcutPath }
+                );
+                Type shortcutType = shortcut.GetType();
+                shortcutType.InvokeMember("TargetPath", BindingFlags.SetProperty, null, shortcut, new object[] { targetPath });
+                shortcutType.InvokeMember("Arguments", BindingFlags.SetProperty, null, shortcut, new object[] { arguments });
+                shortcutType.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, shortcut, new object[] { Path.GetDirectoryName(targetPath) });
+                shortcutType.InvokeMember("Description", BindingFlags.SetProperty, null, shortcut, new object[] { description });
+                shortcutType.InvokeMember("IconLocation", BindingFlags.SetProperty, null, shortcut, new object[] { targetPath + ",0" });
+                shortcutType.InvokeMember("Save", BindingFlags.InvokeMethod, null, shortcut, null);
+            }
+            catch
+            {
+                // 快捷方式创建失败不阻止安装主体完成。
+            }
+        }
+
+        private static void RemoveShortcut(string shortcutPath)
+        {
+            try
+            {
+                if (File.Exists(shortcutPath))
+                {
+                    File.Delete(shortcutPath);
+                }
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    internal sealed class BootstrapperForm : Form
+    {
+        private readonly Color background = Color.FromArgb(244, 245, 239);
+        private readonly Color surface = Color.FromArgb(255, 255, 252);
+        private readonly Color surfaceHover = Color.FromArgb(226, 235, 224);
+        private readonly Color textPrimary = Color.FromArgb(23, 28, 24);
+        private readonly Color textSecondary = Color.FromArgb(91, 102, 94);
+        private readonly Color accent = Color.FromArgb(151, 179, 155);
+        private readonly Color border = Color.FromArgb(23, 28, 24);
+
+        public BootstrapperForm(string installDirectory)
+        {
+            Text = "安装 CLI List";
+            StartPosition = FormStartPosition.CenterScreen;
+            FormBorderStyle = FormBorderStyle.FixedSingle;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ClientSize = new Size(540, 340);
+            BackColor = background;
+            ForeColor = textPrimary;
+            Font = new Font("Consolas", 9F, FontStyle.Regular, GraphicsUnit.Point);
+
+            var root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 1,
+                RowCount = 2,
+                Padding = new Padding(28, 24, 28, 20)
+            };
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 52F));
+
+            var title = new Label
+            {
+                Text = "CLI LIST 安装",
+                ForeColor = textPrimary,
+                Font = new Font("Consolas", 18F, FontStyle.Bold),
+                AutoSize = true,
+                Margin = new Padding(0, 0, 0, 10)
+            };
+            var body = new Label
+            {
+                Text = "这是 CLI List 首次运行。\n\n" +
+                       "将安装到：" + installDirectory + "\n\n" +
+                       "• 在桌面、文件夹和磁盘的右键菜单添加 “CLI List”\n" +
+                       "• 注册全局快捷键 Ctrl + Alt + Space\n" +
+                       "• 开机自动驻留系统托盘\n" +
+                       "• 创建桌面快捷方式\n\n" +
+                       "无需管理员权限，可随时从托盘菜单卸载。",
+                ForeColor = textSecondary,
+                Font = new Font("Microsoft YaHei UI", 9F),
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.TopLeft
+            };
+
+            var bodyPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 1,
+                RowCount = 2,
+                Margin = Padding.Empty
+            };
+            bodyPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            bodyPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            bodyPanel.Controls.Add(title, 0, 0);
+            bodyPanel.Controls.Add(body, 0, 1);
+
+            var actions = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                BackColor = background
+            };
+            var installButton = CreateActionButton("[ 安装 ]", 96);
+            installButton.Click += (sender, eventArgs) => { DialogResult = DialogResult.Yes; Close(); };
+            var skipButton = CreateActionButton("[ 仅本次运行 ]", 132);
+            skipButton.Click += (sender, eventArgs) => { DialogResult = DialogResult.No; Close(); };
+            actions.Controls.Add(installButton);
+            actions.Controls.Add(skipButton);
+
+            root.Controls.Add(bodyPanel, 0, 0);
+            root.Controls.Add(actions, 0, 1);
+            Controls.Add(root);
+        }
+
+        private Button CreateActionButton(string text, int width)
+        {
+            var button = new Button
+            {
+                Text = text,
+                Width = width,
+                Height = 38,
+                Margin = new Padding(8, 0, 0, 0),
+                ForeColor = textPrimary,
+                BackColor = surface,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Consolas", 9F, FontStyle.Bold),
+                Cursor = Cursors.Hand,
+                UseVisualStyleBackColor = false
+            };
+            button.FlatAppearance.BorderColor = border;
+            button.FlatAppearance.BorderSize = 2;
+            button.FlatAppearance.MouseOverBackColor = accent;
+            button.FlatAppearance.MouseDownBackColor = surfaceHover;
+            return button;
+        }
+    }
 }
+
+
+
+
+
+
+

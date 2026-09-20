@@ -1,11 +1,5 @@
 ﻿$ErrorActionPreference = 'Stop'
 
-$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$currentPrincipal = [Security.Principal.WindowsPrincipal]::new($currentIdentity)
-if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw '移除系统右键菜单需要管理员权限，请以管理员身份运行 PowerShell。'
-}
-
 $registryPaths = @(
     'HKCU:\Software\Classes\Directory\Background\shell\CLIList',
     'HKCU:\Software\Classes\Directory\shell\CLIList',
@@ -29,6 +23,7 @@ $shortcutPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'CLI List.ln
 $residentShortcutPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'CLI List Resident.lnk'
 $commandPath = Join-Path $env:USERPROFILE 'bin\cli-list.cmd'
 $installDirectory = Join-Path $env:USERPROFILE '.cli-list'
+$appDataInstallDirectory = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'CLIList'
 $sourceMarkerPath = Join-Path $installDirectory '.source-repository'
 
 Get-Process -Name 'CLIList' -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -42,6 +37,13 @@ if (Test-Path -LiteralPath $commandPath) {
 if (Test-Path -LiteralPath $residentShortcutPath) {
     Remove-Item -LiteralPath $residentShortcutPath -Force
 }
+
+# 清理生产化安装（%LOCALAPPDATA%\CLIList）的注册表标记与安装目录
+Remove-Item -LiteralPath 'HKCU:\Software\CliListApp' -Recurse -Force -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $appDataInstallDirectory) {
+    Remove-Item -LiteralPath $appDataInstallDirectory -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 if (Test-Path -LiteralPath $sourceMarkerPath) {
     $sourceRepository = (Get-Content -LiteralPath $sourceMarkerPath -Raw).Trim()
     if (-not [string]::IsNullOrWhiteSpace($sourceRepository) -and (Test-Path -LiteralPath (Join-Path $sourceRepository '.git'))) {

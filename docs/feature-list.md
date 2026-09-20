@@ -20,5 +20,9 @@
 | 自动构建检查 | 已完成 | GitHub Actions 在 Windows 上构建验证 |
 | 拉取后自动更新 | 已完成 | 首次安装配置 Git Hook，后续 `git pull` 自动构建、验证、同步并重启 |
 | 共享与本机配置 | 已完成 | `commands.json` 多端同步，`commands.local.json` 保存本机覆盖 |
+| 下载即装 | 已完成 | Release zip 解压后首次运行引导安装，免管理员写入 HKCU 右键菜单 |
+| 托盘卸载 | 已完成 | 托盘菜单一键卸载（移除菜单/快捷方式/安装目录） |
+| 版本号 | 已完成 | 程序集版本 0.1.0，托盘与主窗口展示 |
+| Release 自动化 | 已完成 | tag 触发打包 zip + 变更说明 + GitHub Release |
 | 图形化配置编辑器 | 待开始 | 后续替代手动编辑 JSON |
 | 无仓库自动更新 | 暂缓 | 后续可通过 GitHub Release 提供无需拉取代码的更新 |

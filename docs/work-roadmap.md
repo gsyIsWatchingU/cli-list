@@ -1,5 +1,12 @@
 # 开发记录
 
+### 2026-09-20 - 生产化安装与发布自动化
+
+- 本次目标：让用户「下载即装」即可使用，并打通首个 GitHub Release。
+- 实际改动：新增首次运行引导安装（免管理员写入 HKCU 右键菜单、桌面/开机快捷方式，安装到 `%LOCALAPPDATA%\CLIList`）；托盘新增版本展示与一键卸载；`install.ps1`/`uninstall.ps1` 改为 HKCU 免管理员并清理旧 HKLM 残留；共享配置净化（本机路径命令迁入 `commands.local.json`）；新增 `{context:q}`、`{appdir}`/`{appdir:q}` 占位符；程序集版本 0.1.0；新增 tag 触发 Release workflow（zip + 变更说明 + GitHub Release）。
+- 验证重点：构建与配置校验、安装版合并配置校验、HKCU 注册表写入、旧 HKLM 清理、驻留进程重启。
+- 修复记录：工作区原有拖拽排序/自绘滚动条代码存在三处编译错误（`exitItem` 未声明、`Control.BorderStyle`、`ValueChanged` 参数），已修复。
+
 ### 2026-09-13 - 快捷键窗口前置修复
 
 - 本次目标：解决快捷键触发后窗口被当前应用遮挡的问题。

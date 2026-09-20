@@ -18,22 +18,12 @@
     "CloseAfterLaunch": true
   },
   {
-    "Id": "remote-traecode",
-    "Name": "打开远端 TraeCode",
-    "Description": "使用 TraeCode 连接 mygpu 并打开 /workspace/projects",
-    "Tags": ["开发", "远程", "GPU"],
-    "Executable": "%SystemRoot%\\System32\\wscript.exe",
-    "Arguments": "//B \"%USERPROFILE%\\.cli-list\\gpu-trae.vbs\"",
-    "WorkingDirectory": "{context}",
-    "CloseAfterLaunch": true
-  },
-  {
     "Id": "open-explorer",
     "Name": "在资源管理器中打开",
     "Description": "使用资源管理器打开当前目录",
     "Tags": ["目录", "本地"],
     "Executable": "explorer.exe",
-    "Arguments": "\"{context}\"",
+    "Arguments": "{context:q}",
     "WorkingDirectory": "{context}",
     "CloseAfterLaunch": true
   },
@@ -56,52 +46,12 @@
     "CloseAfterLaunch": true
   },
   {
-    "Id": "start-skill-atlas",
-    "Name": "启动 Skill Atlas",
-    "Description": "以开发模式启动并自动刷新界面",
-    "Tags": ["开发", "工具"],
-    "Executable": "%SystemRoot%\\System32\\wscript.exe",
-    "Arguments": "//B \"%USERPROFILE%\\.cli-list\\skill-atlas-dev.vbs\"",
-    "WorkingDirectory": "E:\\prj-gsy\\skill-atlas",
-    "CloseAfterLaunch": true
-  },
-  {
-    "Id": "start-tool-desk",
-    "Name": "一键启动 Tool Desk",
-    "Description": "以开发模式启动 Interview Copilot（tool-desk）桌面应用",
-    "Tags": ["开发", "工具", "面试"],
-    "Executable": "%SystemRoot%\\System32\\wscript.exe",
-    "Arguments": "//B \"%USERPROFILE%\\.cli-list\\tool-desk-start.vbs\"",
-    "WorkingDirectory": "E:\\prj-gsy\\tool-desk",
-    "CloseAfterLaunch": true
-  },
-  {
-    "Id": "start-travel-test",
-    "Name": "一键启动差旅报销工具",
-    "Description": "构建并启动差旅报销判断工具（API + 结果页），自动避开占用端口并打开浏览器",
-    "Tags": ["开发", "工具", "面试"],
-    "Executable": "%SystemRoot%\\System32\\wscript.exe",
-    "Arguments": "//B \"%USERPROFILE%\\.cli-list\\travel-test-start.vbs\"",
-    "WorkingDirectory": "E:\\prj-gsy\\travel-test",
-    "CloseAfterLaunch": true
-  },
-  {
-    "Id": "open-zotero",
-    "Name": "打开 Zotero",
-    "Description": "启动 Zotero 文献管理器",
-    "Tags": ["研究", "工具"],
-    "Executable": "%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs\\Zotero.lnk",
-    "Arguments": "",
-    "WorkingDirectory": "D:\\software\\Zotero",
-    "CloseAfterLaunch": true
-  },
-  {
     "Id": "minimize-all-windows",
     "Name": "最小化所有窗口",
     "Description": "一键最小化所有窗口，直接显示桌面",
     "Tags": ["系统", "窗口"],
     "Executable": "%SystemRoot%\\System32\\wscript.exe",
-    "Arguments": "//B \"%USERPROFILE%\\.cli-list\\minimize-all.vbs\"",
+    "Arguments": "//B {appdir:q}\\minimize-all.vbs",
     "WorkingDirectory": "{context}",
     "CloseAfterLaunch": true
   }
