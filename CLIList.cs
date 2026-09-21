@@ -3669,7 +3669,7 @@ namespace CliListApp
             var closeButton = CreateFooterButton("关闭");
             closeButton.Click += (sender, eventArgs) => Close();
 
-            var aiEditButton = CreateFooterButton("AI 修改命令");
+            var aiEditButton = CreateFooterButton("增/删/改命令");
             aiEditButton.Click += (sender, eventArgs) =>
             {
                 using (var editor = new AiCommandEditorForm(
