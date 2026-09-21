@@ -19,8 +19,8 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("CLI List")]
 [assembly: AssemblyProduct("CLI List")]
-[assembly: AssemblyVersion("0.3.0")]
-[assembly: AssemblyFileVersion("0.3.0")]
+[assembly: AssemblyVersion("0.3.1")]
+[assembly: AssemblyFileVersion("0.3.1")]
 
 namespace CliListApp
 {
@@ -1528,6 +1528,8 @@ namespace CliListApp
 
     internal static class AiCommandPatchService
     {
+        internal const int UserRequestMaxLength = 300;
+        internal const int AiResponseMaxLength = 20000;
         private static readonly JavaScriptSerializer Serializer = new JavaScriptSerializer();
         private static readonly HashSet<string> EditableFields = new HashSet<string>(new[]
         {
@@ -1550,6 +1552,10 @@ namespace CliListApp
             if (string.IsNullOrWhiteSpace(request))
             {
                 throw new InvalidDataException("请先描述要新增、修改或隐藏哪些命令。");
+            }
+            if (request.Trim().Length > UserRequestMaxLength)
+            {
+                throw new InvalidDataException("需求描述不能超过 " + UserRequestMaxLength + " 字。");
             }
 
             List<CommandItem> commands = Program.LoadCommands(sharedConfigPath)
@@ -1599,6 +1605,10 @@ namespace CliListApp
             string localConfigPath,
             string expectedFingerprint)
         {
+            if ((response ?? string.Empty).Length > AiResponseMaxLength)
+            {
+                throw new InvalidDataException("AI 返回内容不能超过 " + AiResponseMaxLength + " 字。");
+            }
             string currentFingerprint = ComputeFingerprint(sharedConfigPath, localConfigPath);
             if (!string.Equals(currentFingerprint, expectedFingerprint, StringComparison.Ordinal))
             {
@@ -2029,6 +2039,7 @@ namespace CliListApp
         private readonly Label stepLabel;
         private readonly Label instructionLabel;
         private readonly TextBox inputBox;
+        private readonly Label characterLimitLabel;
         private readonly Button primaryButton;
         private readonly Button backButton;
         private readonly Button undoButton;
@@ -2089,6 +2100,26 @@ namespace CliListApp
                 ForeColor = ForeColor,
                 Font = new Font("Microsoft YaHei UI", 10F)
             };
+            inputBox.TextChanged += (sender, eventArgs) => UpdateCharacterLimit();
+            characterLimitLabel = new Label
+            {
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.MiddleRight,
+                ForeColor = Color.FromArgb(91, 102, 94),
+                Font = new Font("Microsoft YaHei UI", 8.5F)
+            };
+            var inputPanel = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 2,
+                Margin = Padding.Empty,
+                BackColor = BackColor
+            };
+            inputPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            inputPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 24F));
+            inputPanel.Controls.Add(inputBox, 0, 0);
+            inputPanel.Controls.Add(characterLimitLabel, 0, 1);
             var safetyLabel = new Label
             {
                 Dock = DockStyle.Fill,
@@ -2117,7 +2148,7 @@ namespace CliListApp
 
             root.Controls.Add(stepLabel, 0, 0);
             root.Controls.Add(instructionLabel, 0, 1);
-            root.Controls.Add(inputBox, 0, 2);
+            root.Controls.Add(inputPanel, 0, 2);
             root.Controls.Add(safetyLabel, 0, 3);
             root.Controls.Add(footer, 0, 4);
             Controls.Add(root);
@@ -2227,10 +2258,15 @@ namespace CliListApp
             backButton.Visible = step > 1;
             undoButton.Visible = step == 1 && AiCommandPatchService.CanUndo(localConfigPath);
             inputBox.ReadOnly = step == 3;
+            inputBox.MaxLength = step == 1
+                ? AiCommandPatchService.UserRequestMaxLength
+                : AiCommandPatchService.AiResponseMaxLength;
+            characterLimitLabel.Visible = step < 3;
             if (step == 1)
             {
                 stepLabel.Text = "1 / 3  描述你要改什么";
-                instructionLabel.Text = "直接说人话，例如：新增一个在当前目录打开 Cursor 的命令；隐藏 VS Code；把 PowerShell 标签改成“终端”。";
+                instructionLabel.Text = "用自然语言描述即可：" + Environment.NewLine +
+                    "例如：新增 Cursor 命令；隐藏 VS Code；修改 PowerShell 标签。";
                 primaryButton.Text = "复制给 AI";
             }
             else if (step == 2)
@@ -2245,7 +2281,17 @@ namespace CliListApp
                 instructionLabel.Text = "这里只展示将发生的修改。确认后一次应用全部操作；任何一条不合法都不会写入。";
                 primaryButton.Text = "应用 " + plan.PreviewLines.Count.ToString(CultureInfo.InvariantCulture) + " 项修改";
             }
+            UpdateCharacterLimit();
             inputBox.Focus();
+        }
+
+        private void UpdateCharacterLimit()
+        {
+            int limit = step == 1
+                ? AiCommandPatchService.UserRequestMaxLength
+                : AiCommandPatchService.AiResponseMaxLength;
+            characterLimitLabel.Text = inputBox.TextLength.ToString("N0", CultureInfo.InvariantCulture) +
+                " / " + limit.ToString("N0", CultureInfo.InvariantCulture) + " 字";
         }
     }
 
