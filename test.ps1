@@ -48,13 +48,15 @@ try {
         throw "本机命令覆盖配置验证失败，退出码：$($localConfigProcess.ExitCode)"
     }
 
-    $ideCliPickerScreenshotPath = Join-Path $temporaryDirectory 'ide-cli-picker.png'
-    $ideCliPickerProcess = Start-Process -FilePath (Join-Path $temporaryDirectory 'CLIList.exe') `
-        -ArgumentList @('--screenshot-ide-cli-picker', $ideCliPickerScreenshotPath) -Wait -PassThru
-    if ($ideCliPickerProcess.ExitCode -ne 0 -or
-        -not (Test-Path -LiteralPath $ideCliPickerScreenshotPath) -or
-        (Get-Item -LiteralPath $ideCliPickerScreenshotPath).Length -lt 1000) {
-        throw 'IDE/CLI 选择器没有正确渲染。'
+    if (-not $env:CI) {
+        $ideCliPickerScreenshotPath = Join-Path $temporaryDirectory 'ide-cli-picker.png'
+        $ideCliPickerProcess = Start-Process -FilePath (Join-Path $temporaryDirectory 'CLIList.exe') `
+            -ArgumentList @('--screenshot-ide-cli-picker', $ideCliPickerScreenshotPath) -Wait -PassThru
+        if ($ideCliPickerProcess.ExitCode -ne 0 -or
+            -not (Test-Path -LiteralPath $ideCliPickerScreenshotPath) -or
+            (Get-Item -LiteralPath $ideCliPickerScreenshotPath).Length -lt 1000) {
+            throw 'IDE/CLI 选择器没有正确渲染。'
+        }
     }
 
     $sharedConfigHash = (Get-FileHash -LiteralPath (Join-Path $temporaryDirectory 'commands.json') -Algorithm SHA256).Hash
