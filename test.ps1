@@ -68,6 +68,56 @@ try {
         throw 'AI 增量命令不应修改共享 commands.json。'
     }
 
+    $previewNamePatchPath = Join-Path $temporaryDirectory 'ai-preview-name-patch.json'
+    '{"version":1,"ops":[{"op":"add","fields":{"Name":"原始名称","Executable":"cmd.exe"}}]}' |
+        Set-Content -LiteralPath $previewNamePatchPath -Encoding UTF8
+    [string]$sharedConfigPath = Join-Path $temporaryDirectory 'commands.json'
+    [string]$localConfigPath = Join-Path $temporaryDirectory 'commands.local.json'
+    $previewNameTestScriptPath = Join-Path $temporaryDirectory 'test-preview-name.ps1'
+    @'
+param(
+    [string]$ExecutablePath,
+    [string]$PatchPath,
+    [string]$SharedConfigPath,
+    [string]$LocalConfigPath
+)
+$ErrorActionPreference = 'Stop'
+$assembly = [Reflection.Assembly]::Load([IO.File]::ReadAllBytes($ExecutablePath))
+$serviceType = $assembly.GetType('CliListApp.AiCommandPatchService', $true)
+[string]$fingerprint = $serviceType.GetMethod('ComputeFingerprint').Invoke($null, [object[]]@($SharedConfigPath, $LocalConfigPath))
+[string]$patch = Get-Content -LiteralPath $PatchPath -Raw
+$plan = $serviceType.GetMethod('Prepare').Invoke($null, [object[]]@(
+    $patch,
+    $SharedConfigPath,
+    $LocalConfigPath,
+    $fingerprint
+))
+$editedNames = New-Object 'System.Collections.Generic.Dictionary[int,string]'
+$editedNames.Add(0, '确认页重命名')
+$serviceType.GetMethod('UpdatePreviewNames').Invoke(
+    $null,
+    [object[]]@($plan.PSObject.BaseObject, $editedNames.PSObject.BaseObject)
+) | Out-Null
+$serviceType.GetMethod('Apply').Invoke(
+    $null,
+    [object[]]@($plan.PSObject.BaseObject, $SharedConfigPath, $LocalConfigPath)
+) | Out-Null
+'@ | Set-Content -LiteralPath $previewNameTestScriptPath -Encoding Unicode
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $previewNameTestScriptPath `
+        -ExecutablePath (Join-Path $temporaryDirectory 'CLIList.exe') `
+        -PatchPath $previewNamePatchPath `
+        -SharedConfigPath $sharedConfigPath `
+        -LocalConfigPath $localConfigPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "确认页名称编辑测试失败，退出码：$LASTEXITCODE"
+    }
+
+    $localCommands = @(Get-Content -LiteralPath $localConfigPath -Raw | ConvertFrom-Json)
+    $renamedCommand = $localCommands | Where-Object Name -eq '确认页重命名'
+    if (-not $renamedCommand -or $renamedCommand.Executable -ne 'cmd.exe') {
+        throw '确认页名称编辑没有保留其他命令配置。'
+    }
+
     $localHashBeforeInvalidPatch = (Get-FileHash -LiteralPath (Join-Path $temporaryDirectory 'commands.local.json') -Algorithm SHA256).Hash
     $invalidPatchPath = Join-Path $temporaryDirectory 'ai-patch-invalid.json'
     '{"version":1,"ops":[{"op":"update","id":"open-powershell","fields":{"Id":"forbidden"}}]}' |

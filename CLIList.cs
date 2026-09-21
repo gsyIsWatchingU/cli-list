@@ -1523,7 +1523,36 @@ namespace CliListApp
     {
         public string Fingerprint { get; set; }
         public List<CommandItem> LocalCommands { get; set; }
-        public List<string> PreviewLines { get; set; }
+        public List<AiCommandPatchPreviewItem> PreviewItems { get; set; }
+
+        public List<string> PreviewLines
+        {
+            get { return PreviewItems.Select(item => item.ToPreviewLine()).ToList(); }
+        }
+    }
+
+    internal sealed class AiCommandPatchPreviewItem
+    {
+        public string OperationLabel { get; set; }
+        public string Detail { get; set; }
+        public string FixedName { get; set; }
+        public CommandItem EditableCommand { get; set; }
+
+        public bool CanEditName
+        {
+            get { return EditableCommand != null; }
+        }
+
+        public string Name
+        {
+            get { return CanEditName ? EditableCommand.Name : FixedName; }
+        }
+
+        public string ToPreviewLine()
+        {
+            string line = OperationLabel + "：“" + Name + "”";
+            return string.IsNullOrWhiteSpace(Detail) ? line : line + " · " + Detail;
+        }
     }
 
     internal static class AiCommandPatchService
@@ -1630,7 +1659,7 @@ namespace CliListApp
 
             List<CommandItem> merged = Program.LoadCommands(sharedConfigPath);
             List<CommandItem> local = ReadLocalCommands(localConfigPath);
-            var preview = new List<string>();
+            var preview = new List<AiCommandPatchPreviewItem>();
             var touchedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             foreach (object operationValue in operations)
@@ -1671,7 +1700,12 @@ namespace CliListApp
                     ApplyFields(added, fields);
                     local.Add(added);
                     merged.Add(added);
-                    preview.Add("新增：“" + added.Name + "”");
+                    preview.Add(new AiCommandPatchPreviewItem
+                    {
+                        OperationLabel = "新增",
+                        Detail = "名称可编辑，其他配置保持不变",
+                        EditableCommand = added
+                    });
                     continue;
                 }
 
@@ -1707,7 +1741,12 @@ namespace CliListApp
                         local.Add(disabled);
                     }
                     merged.Remove(target);
-                    preview.Add("隐藏：“" + target.Name + "”");
+                    preview.Add(new AiCommandPatchPreviewItem
+                    {
+                        OperationLabel = "隐藏",
+                        Detail = "将从命令面板隐藏",
+                        FixedName = target.Name
+                    });
                     continue;
                 }
 
@@ -1736,7 +1775,12 @@ namespace CliListApp
                 }
                 int mergedIndex = merged.IndexOf(target);
                 merged[mergedIndex] = updated;
-                preview.Add("修改：“" + updated.Name + "” · " + string.Join("、", updateFields.Keys.Select(FieldDisplayName)));
+                preview.Add(new AiCommandPatchPreviewItem
+                {
+                    OperationLabel = "修改",
+                    Detail = "修改字段：" + string.Join("、", updateFields.Keys.Select(FieldDisplayName)),
+                    EditableCommand = updated
+                });
             }
 
             ValidateProspective(sharedConfigPath, local);
@@ -1744,8 +1788,40 @@ namespace CliListApp
             {
                 Fingerprint = expectedFingerprint,
                 LocalCommands = local,
-                PreviewLines = preview
+                PreviewItems = preview
             };
+        }
+
+        public static void UpdatePreviewNames(AiCommandPatchPlan plan, IDictionary<int, string> names)
+        {
+            if (plan == null)
+            {
+                throw new ArgumentNullException("plan");
+            }
+            if (names == null)
+            {
+                throw new ArgumentNullException("names");
+            }
+
+            List<int> editableIndexes = plan.PreviewItems
+                .Select((item, index) => new { Item = item, Index = index })
+                .Where(value => value.Item.CanEditName)
+                .Select(value => value.Index)
+                .ToList();
+            if (names.Count != editableIndexes.Count || editableIndexes.Any(index => !names.ContainsKey(index)))
+            {
+                throw new InvalidDataException("名称编辑项与本次增量修改不一致，请重新预览。");
+            }
+
+            var normalizedNames = new Dictionary<int, string>();
+            foreach (int index in editableIndexes)
+            {
+                normalizedNames[index] = ValueString(names[index], "名称", 80);
+            }
+            foreach (KeyValuePair<int, string> pair in normalizedNames)
+            {
+                plan.PreviewItems[pair.Key].EditableCommand.Name = pair.Value;
+            }
         }
 
         public static void Apply(AiCommandPatchPlan plan, string sharedConfigPath, string localConfigPath)
@@ -2039,6 +2115,9 @@ namespace CliListApp
         private readonly Label stepLabel;
         private readonly Label instructionLabel;
         private readonly TextBox inputBox;
+        private readonly FlowLayoutPanel previewList;
+        private readonly Dictionary<int, TextBox> previewNameEditors;
+        private readonly List<Control> previewCards;
         private readonly Label characterLimitLabel;
         private readonly Button primaryButton;
         private readonly Button backButton;
@@ -2101,6 +2180,19 @@ namespace CliListApp
                 Font = new Font("Microsoft YaHei UI", 10F)
             };
             inputBox.TextChanged += (sender, eventArgs) => UpdateCharacterLimit();
+            previewNameEditors = new Dictionary<int, TextBox>();
+            previewCards = new List<Control>();
+            previewList = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoScroll = true,
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                BackColor = BackColor,
+                Padding = new Padding(0, 0, 4, 0),
+                Visible = false
+            };
+            previewList.ClientSizeChanged += (sender, eventArgs) => ResizePreviewCards();
             characterLimitLabel = new Label
             {
                 Dock = DockStyle.Fill,
@@ -2118,7 +2210,15 @@ namespace CliListApp
             };
             inputPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
             inputPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 24F));
-            inputPanel.Controls.Add(inputBox, 0, 0);
+            var editorHost = new Panel
+            {
+                Dock = DockStyle.Fill,
+                Margin = Padding.Empty,
+                BackColor = BackColor
+            };
+            editorHost.Controls.Add(inputBox);
+            editorHost.Controls.Add(previewList);
+            inputPanel.Controls.Add(editorHost, 0, 0);
             inputPanel.Controls.Add(characterLimitLabel, 0, 1);
             var safetyLabel = new Label
             {
@@ -2206,12 +2306,17 @@ namespace CliListApp
                         copiedFingerprint
                     );
                     step = 3;
-                    inputBox.Text = string.Join(Environment.NewLine, plan.PreviewLines.Select((line, index) =>
-                        (index + 1).ToString(CultureInfo.InvariantCulture) + ". " + line));
+                    BuildPreviewEditor();
                     UpdateStep();
                     return;
                 }
 
+                var editedNames = new Dictionary<int, string>();
+                foreach (KeyValuePair<int, TextBox> editor in previewNameEditors)
+                {
+                    editedNames[editor.Key] = editor.Value.Text;
+                }
+                AiCommandPatchService.UpdatePreviewNames(plan, editedNames);
                 AiCommandPatchService.Apply(plan, sharedConfigPath, localConfigPath);
                 MessageBox.Show(this, "命令已更新。", "AI 修改命令", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 DialogResult = DialogResult.OK;
@@ -2257,7 +2362,16 @@ namespace CliListApp
         {
             backButton.Visible = step > 1;
             undoButton.Visible = step == 1 && AiCommandPatchService.CanUndo(localConfigPath);
-            inputBox.ReadOnly = step == 3;
+            inputBox.Visible = step < 3;
+            previewList.Visible = step == 3;
+            if (step == 3)
+            {
+                previewList.BringToFront();
+            }
+            else
+            {
+                inputBox.BringToFront();
+            }
             inputBox.MaxLength = step == 1
                 ? AiCommandPatchService.UserRequestMaxLength
                 : AiCommandPatchService.AiResponseMaxLength;
@@ -2278,11 +2392,115 @@ namespace CliListApp
             else
             {
                 stepLabel.Text = "3 / 3  确认增量修改";
-                instructionLabel.Text = "这里只展示将发生的修改。确认后一次应用全部操作；任何一条不合法都不会写入。";
-                primaryButton.Text = "应用 " + plan.PreviewLines.Count.ToString(CultureInfo.InvariantCulture) + " 项修改";
+                instructionLabel.Text = "可直接优化命令名称；程序、参数等配置保持不变。确认后一次应用全部操作。";
+                primaryButton.Text = "应用 " + plan.PreviewItems.Count.ToString(CultureInfo.InvariantCulture) + " 项修改";
             }
             UpdateCharacterLimit();
-            inputBox.Focus();
+            if (step == 3 && previewNameEditors.Count > 0)
+            {
+                TextBox firstEditor = previewNameEditors.OrderBy(editor => editor.Key).First().Value;
+                firstEditor.Focus();
+                firstEditor.SelectAll();
+            }
+            else
+            {
+                inputBox.Focus();
+            }
+        }
+
+        private void BuildPreviewEditor()
+        {
+            previewList.SuspendLayout();
+            foreach (Control control in previewList.Controls.Cast<Control>().ToList())
+            {
+                control.Dispose();
+            }
+            previewList.Controls.Clear();
+            previewNameEditors.Clear();
+            previewCards.Clear();
+
+            for (int index = 0; index < plan.PreviewItems.Count; index++)
+            {
+                AiCommandPatchPreviewItem item = plan.PreviewItems[index];
+                var card = new TableLayoutPanel
+                {
+                    Height = 68,
+                    ColumnCount = 2,
+                    RowCount = 2,
+                    Margin = new Padding(0, 0, 0, 8),
+                    Padding = new Padding(10, 6, 10, 6),
+                    BackColor = Color.FromArgb(255, 255, 252)
+                };
+                card.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 76F));
+                card.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+                card.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
+                card.RowStyles.Add(new RowStyle(SizeType.Absolute, 24F));
+
+                var operationLabel = new Label
+                {
+                    Dock = DockStyle.Fill,
+                    Text = (index + 1).ToString(CultureInfo.InvariantCulture) + ". " + item.OperationLabel,
+                    TextAlign = ContentAlignment.MiddleLeft,
+                    Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+                    ForeColor = ForeColor
+                };
+                Control nameControl;
+                if (item.CanEditName)
+                {
+                    var nameEditor = new TextBox
+                    {
+                        Dock = DockStyle.Fill,
+                        Text = item.Name,
+                        MaxLength = 80,
+                        BorderStyle = BorderStyle.FixedSingle,
+                        BackColor = Color.White,
+                        ForeColor = ForeColor,
+                        Font = new Font("Microsoft YaHei UI", 9.5F),
+                        Margin = new Padding(0, 3, 0, 1)
+                    };
+                    previewNameEditors[index] = nameEditor;
+                    nameControl = nameEditor;
+                }
+                else
+                {
+                    nameControl = new Label
+                    {
+                        Dock = DockStyle.Fill,
+                        Text = item.Name,
+                        TextAlign = ContentAlignment.MiddleLeft,
+                        ForeColor = ForeColor,
+                        Font = new Font("Microsoft YaHei UI", 9.5F),
+                        Padding = new Padding(1, 0, 0, 0)
+                    };
+                }
+                var detailLabel = new Label
+                {
+                    Dock = DockStyle.Fill,
+                    Text = item.Detail,
+                    TextAlign = ContentAlignment.MiddleLeft,
+                    ForeColor = Color.FromArgb(91, 102, 94),
+                    Font = new Font("Microsoft YaHei UI", 8.5F)
+                };
+
+                card.Controls.Add(operationLabel, 0, 0);
+                card.SetRowSpan(operationLabel, 2);
+                card.Controls.Add(nameControl, 1, 0);
+                card.Controls.Add(detailLabel, 1, 1);
+                previewCards.Add(card);
+                previewList.Controls.Add(card);
+            }
+            ResizePreviewCards();
+            previewList.ResumeLayout();
+        }
+
+        private void ResizePreviewCards()
+        {
+            int width = Math.Max(320, previewList.ClientSize.Width - previewList.Padding.Horizontal -
+                SystemInformation.VerticalScrollBarWidth - 4);
+            foreach (Control card in previewCards)
+            {
+                card.Width = width;
+            }
         }
 
         private void UpdateCharacterLimit()
