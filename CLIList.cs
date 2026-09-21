@@ -1196,8 +1196,7 @@ namespace CliListApp
             openItem.Click += (sender, eventArgs) => ShowCommandPanel(null, false);
             var versionItem = new ToolStripMenuItem(AppInfo.DisplayName);
             versionItem.Enabled = false;
-            updateItem = new ToolStripMenuItem("有新版本");
-            updateItem.Visible = false;
+            updateItem = new ToolStripMenuItem("检查更新…");
             updateItem.Click += (sender, eventArgs) => UpdateManager.CheckForUpdate(null, appDirectory);
             var uninstallItem = new ToolStripMenuItem("卸载 CLI List…");
             uninstallItem.Click += (sender, eventArgs) => UninstallFromTray();
@@ -3684,8 +3683,7 @@ namespace CliListApp
                 }
             };
 
-            updateButton = CreateFooterButton("有新版本");
-            updateButton.Visible = false;
+            updateButton = CreateFooterButton("检查更新");
             updateButton.Click += (sender, eventArgs) => UpdateManager.CheckForUpdate(this, appDirectory);
 
             footer.Controls.Add(closeButton);

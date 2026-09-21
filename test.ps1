@@ -14,6 +14,15 @@ foreach ($scriptPath in Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1'
     }
 }
 
+$sourceText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'CLIList.cs') -Raw
+if ($sourceText -notmatch 'BeginSilentCheck\(tagName\s*=>') {
+    throw 'CLI List 启动流程缺少静默更新检查。'
+}
+if ($sourceText -notmatch 'new ToolStripMenuItem\("检查更新…"\)' -or
+    $sourceText -notmatch 'CreateFooterButton\("检查更新"\)') {
+    throw 'CLI List 的托盘或主窗口缺少常驻“检查更新”入口。'
+}
+
 if (-not $SkipBuild) {
     & (Join-Path $PSScriptRoot 'build.ps1') -SkipInstalledSync:$SkipInstalledSync
 }
