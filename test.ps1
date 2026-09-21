@@ -38,6 +38,58 @@ try {
     if ($localConfigProcess.ExitCode -ne 0) {
         throw "本机命令覆盖配置验证失败，退出码：$($localConfigProcess.ExitCode)"
     }
+
+    $sharedConfigHash = (Get-FileHash -LiteralPath (Join-Path $temporaryDirectory 'commands.json') -Algorithm SHA256).Hash
+    $patchPath = Join-Path $temporaryDirectory 'ai-patch.json'
+    @'
+{
+  "version": 1,
+  "ops": [
+    {"op":"update","id":"open-powershell","fields":{"Description":"AI 增量修改测试"}},
+    {"op":"delete","id":"open-vscode"},
+    {"op":"add","fields":{"Name":"测试命令","Description":"仅用于自动化验证","Tags":["测试"],"Executable":"cmd.exe","Arguments":"/c echo ok","WorkingDirectory":"{context}","CloseAfterLaunch":true}}
+  ]
+}
+'@ | Set-Content -LiteralPath $patchPath -Encoding UTF8
+    $patchProcess = Start-Process -FilePath (Join-Path $temporaryDirectory 'CLIList.exe') -ArgumentList @('--apply-ai-patch', $patchPath) -Wait -PassThru
+    if ($patchProcess.ExitCode -ne 0) {
+        throw "AI 增量命令应用失败，退出码：$($patchProcess.ExitCode)"
+    }
+
+    $localCommands = @(Get-Content -LiteralPath (Join-Path $temporaryDirectory 'commands.local.json') -Raw | ConvertFrom-Json)
+    $updatedCommand = $localCommands | Where-Object Id -eq 'open-powershell'
+    $hiddenCommand = $localCommands | Where-Object Id -eq 'open-vscode'
+    $addedCommand = $localCommands | Where-Object Name -eq '测试命令'
+    if ($updatedCommand.Description -ne 'AI 增量修改测试' -or -not $hiddenCommand.Disabled -or
+        -not $addedCommand.Id.StartsWith('local-')) {
+        throw 'AI 增量命令没有正确执行新增、修改和隐藏。'
+    }
+    if ((Get-FileHash -LiteralPath (Join-Path $temporaryDirectory 'commands.json') -Algorithm SHA256).Hash -ne $sharedConfigHash) {
+        throw 'AI 增量命令不应修改共享 commands.json。'
+    }
+
+    $localHashBeforeInvalidPatch = (Get-FileHash -LiteralPath (Join-Path $temporaryDirectory 'commands.local.json') -Algorithm SHA256).Hash
+    $invalidPatchPath = Join-Path $temporaryDirectory 'ai-patch-invalid.json'
+    '{"version":1,"ops":[{"op":"update","id":"open-powershell","fields":{"Id":"forbidden"}}]}' |
+        Set-Content -LiteralPath $invalidPatchPath -Encoding UTF8
+    $invalidPatchProcess = Start-Process -FilePath (Join-Path $temporaryDirectory 'CLIList.exe') -ArgumentList @('--apply-ai-patch', $invalidPatchPath) -Wait -PassThru
+    if ($invalidPatchProcess.ExitCode -eq 0) {
+        throw 'AI 增量命令应拒绝非白名单字段。'
+    }
+    if ((Get-FileHash -LiteralPath (Join-Path $temporaryDirectory 'commands.local.json') -Algorithm SHA256).Hash -ne $localHashBeforeInvalidPatch) {
+        throw '非法 AI 增量命令不应改写本机配置。'
+    }
+
+    $fullConfigPatchPath = Join-Path $temporaryDirectory 'ai-patch-full-config.json'
+    '[{"Id":"replace-all","Name":"不允许整份替换","Executable":"cmd.exe"}]' |
+        Set-Content -LiteralPath $fullConfigPatchPath -Encoding UTF8
+    $fullConfigPatchProcess = Start-Process -FilePath (Join-Path $temporaryDirectory 'CLIList.exe') -ArgumentList @('--apply-ai-patch', $fullConfigPatchPath) -Wait -PassThru
+    if ($fullConfigPatchProcess.ExitCode -eq 0) {
+        throw 'AI 增量命令应拒绝整份配置数组。'
+    }
+    if ((Get-FileHash -LiteralPath (Join-Path $temporaryDirectory 'commands.local.json') -Algorithm SHA256).Hash -ne $localHashBeforeInvalidPatch) {
+        throw '整份配置数组被拒绝后不应改写本机配置。'
+    }
 }
 finally {
     $resolvedTemporaryDirectory = [IO.Path]::GetFullPath($temporaryDirectory)

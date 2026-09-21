@@ -19,8 +19,8 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("CLI List")]
 [assembly: AssemblyProduct("CLI List")]
-[assembly: AssemblyVersion("0.2.0")]
-[assembly: AssemblyFileVersion("0.2.0")]
+[assembly: AssemblyVersion("0.3.0")]
+[assembly: AssemblyFileVersion("0.3.0")]
 
 namespace CliListApp
 {
@@ -147,10 +147,14 @@ namespace CliListApp
             bool validateOnly = args.Any(value => string.Equals(value, "--validate", StringComparison.OrdinalIgnoreCase));
             bool residentRequested = args.Any(value => string.Equals(value, "--resident", StringComparison.OrdinalIgnoreCase));
             string screenshotPath = GetOptionValue(args, "--screenshot");
+            string aiEditorScreenshotPath = GetOptionValue(args, "--screenshot-ai-editor");
             string browserScreenshotPath = GetOptionValue(args, "--screenshot-browser");
             string browserPickerScreenshotPath = GetOptionValue(args, "--screenshot-browser-picker");
             string previewFilePath = GetOptionValue(args, "--preview-file");
-            bool automatedMode = validateOnly || !string.IsNullOrWhiteSpace(screenshotPath) || !string.IsNullOrWhiteSpace(browserScreenshotPath) || !string.IsNullOrWhiteSpace(browserPickerScreenshotPath);
+            string aiPatchPath = GetOptionValue(args, "--apply-ai-patch");
+            bool automatedMode = validateOnly || !string.IsNullOrWhiteSpace(screenshotPath) ||
+                !string.IsNullOrWhiteSpace(aiEditorScreenshotPath) || !string.IsNullOrWhiteSpace(aiPatchPath) ||
+                !string.IsNullOrWhiteSpace(browserScreenshotPath) || !string.IsNullOrWhiteSpace(browserPickerScreenshotPath);
 
             try
             {
@@ -161,6 +165,21 @@ namespace CliListApp
                 if (validateOnly)
                 {
                     LoadCommands(configPath);
+                    Environment.ExitCode = 0;
+                    return;
+                }
+
+                if (!string.IsNullOrWhiteSpace(aiPatchPath))
+                {
+                    string localConfigPath = GetLocalConfigPath(configPath);
+                    string fingerprint = AiCommandPatchService.ComputeFingerprint(configPath, localConfigPath);
+                    AiCommandPatchPlan plan = AiCommandPatchService.Prepare(
+                        File.ReadAllText(Path.GetFullPath(aiPatchPath)),
+                        configPath,
+                        localConfigPath,
+                        fingerprint
+                    );
+                    AiCommandPatchService.Apply(plan, configPath, localConfigPath);
                     Environment.ExitCode = 0;
                     return;
                 }
@@ -198,6 +217,13 @@ namespace CliListApp
                 {
                     var form = CreateMainForm(appDirectory, configPath, usagePath, contextPath);
                     RenderScreenshot(form, screenshotPath);
+                    return;
+                }
+
+                if (!string.IsNullOrWhiteSpace(aiEditorScreenshotPath))
+                {
+                    var form = new AiCommandEditorForm(configPath, GetLocalConfigPath(configPath));
+                    RenderScreenshot(form, aiEditorScreenshotPath);
                     return;
                 }
 
@@ -284,6 +310,13 @@ namespace CliListApp
                 }
 
                 if (string.Equals(args[index], "--screenshot", StringComparison.OrdinalIgnoreCase))
+                {
+                    index++;
+                    continue;
+                }
+
+                if (string.Equals(args[index], "--screenshot-ai-editor", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(args[index], "--apply-ai-patch", StringComparison.OrdinalIgnoreCase))
                 {
                     index++;
                     continue;
@@ -549,9 +582,41 @@ namespace CliListApp
         {
             "commands.json",
             "commands.local.json",
+            "commands.local.json.ai-last.bak",
             "commands.pre-shared-migration.json",
             "usage.json"
         };
+
+        public static void BeginSilentCheck(Action<string> onAvailable)
+        {
+            ThreadPool.QueueUserWorkItem(state =>
+            {
+                try
+                {
+                    System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)3072;
+                    Dictionary<string, object> release = ReadLatestRelease();
+                    string tagName = GetRequiredString(release, "tag_name", "Release 缺少版本号。");
+                    Version currentVersion;
+                    Version latestVersion;
+                    if (!Regex.IsMatch(tagName, @"^v\d+\.\d+\.\d+$") ||
+                        !Version.TryParse(AppInfo.Version, out currentVersion) ||
+                        !Version.TryParse(tagName.Substring(1), out latestVersion) ||
+                        latestVersion <= currentVersion)
+                    {
+                        return;
+                    }
+
+                    if (onAvailable != null)
+                    {
+                        onAvailable(tagName);
+                    }
+                }
+                catch
+                {
+                    // 启动检查不得打断用户；网络恢复后，下次启动会再次检查。
+                }
+            });
+        }
 
         public static void CheckForUpdate(IWin32Window owner, string appDirectory)
         {
@@ -1102,12 +1167,14 @@ namespace CliListApp
         private readonly string usagePath;
         private readonly NotifyIcon trayIcon;
         private readonly ContextMenuStrip trayMenu;
+        private readonly ToolStripMenuItem updateItem;
         private readonly Control dispatcher;
         private readonly GlobalHotKeyWindow hotKeyWindow;
         private readonly Thread pipeThread;
         private volatile bool isExiting;
         private MainForm mainForm;
         private string currentContext;
+        private string availableUpdateTag;
 
         public ResidentApplicationContext(
             string appDirectory,
@@ -1129,7 +1196,8 @@ namespace CliListApp
             openItem.Click += (sender, eventArgs) => ShowCommandPanel(null, false);
             var versionItem = new ToolStripMenuItem(AppInfo.DisplayName);
             versionItem.Enabled = false;
-            var updateItem = new ToolStripMenuItem("检查更新…");
+            updateItem = new ToolStripMenuItem("有新版本");
+            updateItem.Visible = false;
             updateItem.Click += (sender, eventArgs) => UpdateManager.CheckForUpdate(null, appDirectory);
             var uninstallItem = new ToolStripMenuItem("卸载 CLI List…");
             uninstallItem.Click += (sender, eventArgs) => UninstallFromTray();
@@ -1176,6 +1244,26 @@ namespace CliListApp
             if (initiallyVisible)
             {
                 ShowCommandPanel(initialContext, false);
+            }
+
+            UpdateManager.BeginSilentCheck(tagName =>
+            {
+                if (isExiting || dispatcher.IsDisposed)
+                {
+                    return;
+                }
+                dispatcher.BeginInvoke((MethodInvoker)(() => ShowAvailableUpdate(tagName)));
+            });
+        }
+
+        private void ShowAvailableUpdate(string tagName)
+        {
+            availableUpdateTag = tagName;
+            updateItem.Text = "↑ 更新到 " + tagName;
+            updateItem.Visible = true;
+            if (mainForm != null && !mainForm.IsDisposed)
+            {
+                mainForm.ShowAvailableUpdate(tagName);
             }
         }
 
@@ -1267,6 +1355,10 @@ namespace CliListApp
                 {
                     mainForm = Program.CreateMainForm(appDirectory, configPath, usagePath, contextPath);
                     mainForm.FormClosed += (sender, eventArgs) => mainForm = null;
+                    if (!string.IsNullOrWhiteSpace(availableUpdateTag))
+                    {
+                        mainForm.ShowAvailableUpdate(availableUpdateTag);
+                    }
                 }
                 catch (Exception exception)
                 {
@@ -1427,12 +1519,742 @@ namespace CliListApp
         }
     }
 
+    internal sealed class AiCommandPatchPlan
+    {
+        public string Fingerprint { get; set; }
+        public List<CommandItem> LocalCommands { get; set; }
+        public List<string> PreviewLines { get; set; }
+    }
+
+    internal static class AiCommandPatchService
+    {
+        private static readonly JavaScriptSerializer Serializer = new JavaScriptSerializer();
+        private static readonly HashSet<string> EditableFields = new HashSet<string>(new[]
+        {
+            "Name", "Description", "Tags", "Executable", "Arguments", "WorkingDirectory", "CloseAfterLaunch"
+        }, StringComparer.Ordinal);
+
+        public static string ComputeFingerprint(string sharedConfigPath, string localConfigPath)
+        {
+            string shared = File.Exists(sharedConfigPath) ? File.ReadAllText(sharedConfigPath) : string.Empty;
+            string local = File.Exists(localConfigPath) ? File.ReadAllText(localConfigPath) : "<missing>";
+            using (SHA256 sha256 = SHA256.Create())
+            {
+                byte[] hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(shared + "\n--LOCAL--\n" + local));
+                return BitConverter.ToString(hash).Replace("-", string.Empty).ToLowerInvariant();
+            }
+        }
+
+        public static string BuildPrompt(string request, string sharedConfigPath)
+        {
+            if (string.IsNullOrWhiteSpace(request))
+            {
+                throw new InvalidDataException("请先描述要新增、修改或隐藏哪些命令。");
+            }
+
+            List<CommandItem> commands = Program.LoadCommands(sharedConfigPath)
+                .Where(command => !string.Equals(command.Action, "CheckUpdate", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            var visibleCommands = new List<Dictionary<string, object>>();
+            foreach (CommandItem command in commands)
+            {
+                var item = new Dictionary<string, object>();
+                item["Id"] = command.Id;
+                item["Name"] = Redact(command.Name);
+                item["Description"] = Redact(command.Description);
+                item["Tags"] = command.Tags ?? new List<string>();
+                if (!string.IsNullOrWhiteSpace(command.Action))
+                {
+                    item["Action"] = command.Action;
+                }
+                else
+                {
+                    item["Executable"] = Redact(command.Executable);
+                    item["Arguments"] = Redact(command.Arguments);
+                    item["WorkingDirectory"] = Redact(command.WorkingDirectory);
+                    item["CloseAfterLaunch"] = command.CloseAfterLaunch;
+                }
+                visibleCommands.Add(item);
+            }
+
+            var prompt = new StringBuilder();
+            prompt.AppendLine("你是 CLI List 的命令编辑助手。请把用户需求转换成最小增量，不要返回完整配置。");
+            prompt.AppendLine();
+            prompt.AppendLine("用户需求：");
+            prompt.AppendLine(request.Trim());
+            prompt.AppendLine();
+            prompt.AppendLine("当前命令（仅用于定位，可能已隐藏敏感片段）：");
+            prompt.AppendLine(Serializer.Serialize(visibleCommands));
+            prompt.AppendLine();
+            prompt.AppendLine("只输出一个 JSON 对象，不要解释、不要 Markdown。格式必须是：");
+            prompt.AppendLine("{\"version\":1,\"ops\":[{\"op\":\"add\",\"fields\":{...}},{\"op\":\"update\",\"id\":\"现有Id\",\"fields\":{...}},{\"op\":\"delete\",\"id\":\"现有Id\"}]}");
+            prompt.AppendLine("规则：只保留必要操作，最多 10 条；add 不要提供 Id；update/delete 必须使用现有 Id；delete 表示从面板隐藏；不要修改 Id、Action、Disabled。");
+            prompt.AppendLine("fields 只允许 Name、Description、Tags、Executable、Arguments、WorkingDirectory、CloseAfterLaunch。add 必须包含 Name 和 Executable。内置 Action 命令只能修改 Name、Description、Tags。");
+            return prompt.ToString().Trim();
+        }
+
+        public static AiCommandPatchPlan Prepare(
+            string response,
+            string sharedConfigPath,
+            string localConfigPath,
+            string expectedFingerprint)
+        {
+            string currentFingerprint = ComputeFingerprint(sharedConfigPath, localConfigPath);
+            if (!string.Equals(currentFingerprint, expectedFingerprint, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("命令配置已发生变化，请返回第一步重新复制提示词。");
+            }
+
+            Dictionary<string, object> root = ParseRoot(response);
+            EnsureKeys(root, new[] { "version", "ops" }, "根对象");
+            if (Convert.ToInt32(root["version"], CultureInfo.InvariantCulture) != 1)
+            {
+                throw new InvalidDataException("只支持 version=1 的变更指令。");
+            }
+
+            List<object> operations = AsList(root["ops"], "ops");
+            if (operations.Count < 1 || operations.Count > 10)
+            {
+                throw new InvalidDataException("每次必须包含 1 到 10 条增量操作。");
+            }
+
+            List<CommandItem> merged = Program.LoadCommands(sharedConfigPath);
+            List<CommandItem> local = ReadLocalCommands(localConfigPath);
+            var preview = new List<string>();
+            var touchedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (object operationValue in operations)
+            {
+                var operation = operationValue as Dictionary<string, object>;
+                if (operation == null)
+                {
+                    throw new InvalidDataException("ops 中的每一项都必须是对象。");
+                }
+
+                string operationName = RequiredString(operation, "op", 20).ToLowerInvariant();
+                if (operationName == "add")
+                {
+                    EnsureKeys(operation, new[] { "op", "fields" }, "add 操作");
+                    Dictionary<string, object> fields = RequiredFields(operation);
+                    ValidateFieldKeys(fields);
+                    if (!fields.ContainsKey("Name") || !fields.ContainsKey("Executable"))
+                    {
+                        throw new InvalidDataException("add 必须包含 Name 和 Executable。");
+                    }
+
+                    string id;
+                    do
+                    {
+                        id = "local-" + Guid.NewGuid().ToString("N").Substring(0, 12);
+                    }
+                    while (merged.Any(command => string.Equals(command.Id, id, StringComparison.OrdinalIgnoreCase)) ||
+                           local.Any(command => string.Equals(command.Id, id, StringComparison.OrdinalIgnoreCase)));
+
+                    var added = new CommandItem
+                    {
+                        Id = id,
+                        Tags = new List<string>(),
+                        Arguments = string.Empty,
+                        WorkingDirectory = "{context}",
+                        CloseAfterLaunch = true
+                    };
+                    ApplyFields(added, fields);
+                    local.Add(added);
+                    merged.Add(added);
+                    preview.Add("新增：“" + added.Name + "”");
+                    continue;
+                }
+
+                if (operationName != "update" && operationName != "delete")
+                {
+                    throw new InvalidDataException("op 只允许 add、update 或 delete。");
+                }
+
+                string idValue = RequiredString(operation, "id", 160);
+                if (!touchedIds.Add(idValue))
+                {
+                    throw new InvalidDataException("同一个 Id 每次只能修改一次：" + idValue);
+                }
+                CommandItem target = merged.FirstOrDefault(command =>
+                    string.Equals(command.Id, idValue, StringComparison.OrdinalIgnoreCase));
+                if (target == null)
+                {
+                    throw new InvalidDataException("找不到要修改的命令 Id：" + idValue);
+                }
+
+                int localIndex = local.FindIndex(command =>
+                    string.Equals(command.Id, idValue, StringComparison.OrdinalIgnoreCase));
+                if (operationName == "delete")
+                {
+                    EnsureKeys(operation, new[] { "op", "id" }, "delete 操作");
+                    var disabled = new CommandItem { Id = target.Id, Disabled = true };
+                    if (localIndex >= 0)
+                    {
+                        local[localIndex] = disabled;
+                    }
+                    else
+                    {
+                        local.Add(disabled);
+                    }
+                    merged.Remove(target);
+                    preview.Add("隐藏：“" + target.Name + "”");
+                    continue;
+                }
+
+                EnsureKeys(operation, new[] { "op", "id", "fields" }, "update 操作");
+                Dictionary<string, object> updateFields = RequiredFields(operation);
+                ValidateFieldKeys(updateFields);
+                if (updateFields.Count == 0)
+                {
+                    throw new InvalidDataException("update 的 fields 不能为空。");
+                }
+                if (!string.IsNullOrWhiteSpace(target.Action) && updateFields.Keys.Any(key =>
+                    key != "Name" && key != "Description" && key != "Tags"))
+                {
+                    throw new InvalidDataException("内置命令只能修改 Name、Description、Tags。");
+                }
+
+                CommandItem updated = Clone(target);
+                ApplyFields(updated, updateFields);
+                if (localIndex >= 0)
+                {
+                    local[localIndex] = updated;
+                }
+                else
+                {
+                    local.Add(updated);
+                }
+                int mergedIndex = merged.IndexOf(target);
+                merged[mergedIndex] = updated;
+                preview.Add("修改：“" + updated.Name + "” · " + string.Join("、", updateFields.Keys.Select(FieldDisplayName)));
+            }
+
+            ValidateProspective(sharedConfigPath, local);
+            return new AiCommandPatchPlan
+            {
+                Fingerprint = expectedFingerprint,
+                LocalCommands = local,
+                PreviewLines = preview
+            };
+        }
+
+        public static void Apply(AiCommandPatchPlan plan, string sharedConfigPath, string localConfigPath)
+        {
+            if (plan == null)
+            {
+                throw new ArgumentNullException("plan");
+            }
+            if (!string.Equals(ComputeFingerprint(sharedConfigPath, localConfigPath), plan.Fingerprint, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("预览后命令配置发生了变化，本次修改未应用。");
+            }
+
+            ValidateProspective(sharedConfigPath, plan.LocalCommands);
+            SaveLocalCommands(localConfigPath, plan.LocalCommands, true);
+        }
+
+        public static bool CanUndo(string localConfigPath)
+        {
+            return File.Exists(GetBackupPath(localConfigPath));
+        }
+
+        public static void Undo(string sharedConfigPath, string localConfigPath)
+        {
+            string backupPath = GetBackupPath(localConfigPath);
+            if (!File.Exists(backupPath))
+            {
+                throw new InvalidOperationException("没有可恢复的上一次 AI 修改。");
+            }
+            List<CommandItem> previous = Serializer.Deserialize<List<CommandItem>>(File.ReadAllText(backupPath));
+            previous = previous ?? new List<CommandItem>();
+            ValidateProspective(sharedConfigPath, previous);
+            SaveLocalCommands(localConfigPath, previous, false);
+            File.Delete(backupPath);
+        }
+
+        private static Dictionary<string, object> ParseRoot(string response)
+        {
+            string json = (response ?? string.Empty).Trim();
+            Match fenced = Regex.Match(json, @"^```(?:json)?\s*(\{[\s\S]*\})\s*```$", RegexOptions.IgnoreCase);
+            if (fenced.Success)
+            {
+                json = fenced.Groups[1].Value;
+            }
+            else if (!json.StartsWith("{", StringComparison.Ordinal) || !json.EndsWith("}", StringComparison.Ordinal))
+            {
+                throw new InvalidDataException("AI 返回内容必须是纯 JSON 对象，不能包含解释文字。");
+            }
+
+            Dictionary<string, object> root;
+            try
+            {
+                root = Serializer.DeserializeObject(json) as Dictionary<string, object>;
+            }
+            catch (Exception exception)
+            {
+                throw new InvalidDataException("无法解析 AI 返回的 JSON：" + exception.Message);
+            }
+            if (root == null)
+            {
+                throw new InvalidDataException("AI 返回内容必须是 JSON 对象。");
+            }
+            return root;
+        }
+
+        private static List<CommandItem> ReadLocalCommands(string localConfigPath)
+        {
+            if (!File.Exists(localConfigPath))
+            {
+                return new List<CommandItem>();
+            }
+            List<CommandItem> commands = Serializer.Deserialize<List<CommandItem>>(File.ReadAllText(localConfigPath));
+            return commands ?? new List<CommandItem>();
+        }
+
+        private static void ValidateProspective(string sharedConfigPath, List<CommandItem> localCommands)
+        {
+            string tempDirectory = Path.Combine(Path.GetTempPath(), "cli-list-ai-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tempDirectory);
+            try
+            {
+                string tempSharedPath = Path.Combine(tempDirectory, "commands.json");
+                File.Copy(sharedConfigPath, tempSharedPath, true);
+                File.WriteAllText(
+                    Path.Combine(tempDirectory, "commands.local.json"),
+                    Serializer.Serialize(localCommands),
+                    new UTF8Encoding(false)
+                );
+                Program.LoadCommands(tempSharedPath);
+            }
+            finally
+            {
+                if (Directory.Exists(tempDirectory))
+                {
+                    Directory.Delete(tempDirectory, true);
+                }
+            }
+        }
+
+        private static void SaveLocalCommands(string localConfigPath, List<CommandItem> commands, bool createBackup)
+        {
+            string directory = Path.GetDirectoryName(localConfigPath);
+            if (!Directory.Exists(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+            if (createBackup)
+            {
+                string previous = File.Exists(localConfigPath) ? File.ReadAllText(localConfigPath) : "[]";
+                File.WriteAllText(GetBackupPath(localConfigPath), previous, new UTF8Encoding(false));
+            }
+
+            string temporaryPath = localConfigPath + ".ai-" + Guid.NewGuid().ToString("N") + ".tmp";
+            File.WriteAllText(temporaryPath, Serializer.Serialize(commands), new UTF8Encoding(false));
+            try
+            {
+                if (File.Exists(localConfigPath))
+                {
+                    try
+                    {
+                        File.Replace(temporaryPath, localConfigPath, null);
+                    }
+                    catch (PlatformNotSupportedException)
+                    {
+                        File.Copy(temporaryPath, localConfigPath, true);
+                        File.Delete(temporaryPath);
+                    }
+                    catch (IOException)
+                    {
+                        File.Copy(temporaryPath, localConfigPath, true);
+                        File.Delete(temporaryPath);
+                    }
+                }
+                else
+                {
+                    File.Move(temporaryPath, localConfigPath);
+                }
+            }
+            finally
+            {
+                if (File.Exists(temporaryPath))
+                {
+                    File.Delete(temporaryPath);
+                }
+            }
+        }
+
+        private static string GetBackupPath(string localConfigPath)
+        {
+            return localConfigPath + ".ai-last.bak";
+        }
+
+        private static Dictionary<string, object> RequiredFields(Dictionary<string, object> operation)
+        {
+            object value;
+            var fields = operation.TryGetValue("fields", out value) ? value as Dictionary<string, object> : null;
+            if (fields == null)
+            {
+                throw new InvalidDataException("fields 必须是对象。");
+            }
+            return fields;
+        }
+
+        private static void ValidateFieldKeys(Dictionary<string, object> fields)
+        {
+            string unknown = fields.Keys.FirstOrDefault(key => !EditableFields.Contains(key));
+            if (unknown != null)
+            {
+                throw new InvalidDataException("fields 不允许包含字段：" + unknown);
+            }
+        }
+
+        private static void ApplyFields(CommandItem command, Dictionary<string, object> fields)
+        {
+            foreach (KeyValuePair<string, object> pair in fields)
+            {
+                if (pair.Key == "Name") command.Name = ValueString(pair.Value, "Name", 80);
+                else if (pair.Key == "Description") command.Description = ValueString(pair.Value, "Description", 300);
+                else if (pair.Key == "Executable") command.Executable = ValueString(pair.Value, "Executable", 2048);
+                else if (pair.Key == "Arguments") command.Arguments = ValueString(pair.Value, "Arguments", 4096, true);
+                else if (pair.Key == "WorkingDirectory") command.WorkingDirectory = ValueString(pair.Value, "WorkingDirectory", 2048, true);
+                else if (pair.Key == "CloseAfterLaunch")
+                {
+                    if (!(pair.Value is bool)) throw new InvalidDataException("CloseAfterLaunch 必须是布尔值。");
+                    command.CloseAfterLaunch = (bool)pair.Value;
+                }
+                else if (pair.Key == "Tags")
+                {
+                    List<object> values = AsList(pair.Value, "Tags");
+                    if (values.Count > 12) throw new InvalidDataException("Tags 最多 12 个。");
+                    command.Tags = values.Select(value => ValueString(value, "Tags", 30)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                }
+            }
+            if (command.Tags == null) command.Tags = new List<string>();
+        }
+
+        private static CommandItem Clone(CommandItem source)
+        {
+            return new CommandItem
+            {
+                Id = source.Id,
+                Name = source.Name,
+                Description = source.Description,
+                Tags = source.Tags == null ? new List<string>() : new List<string>(source.Tags),
+                Action = source.Action,
+                Executable = source.Executable,
+                Arguments = source.Arguments,
+                WorkingDirectory = source.WorkingDirectory,
+                CloseAfterLaunch = source.CloseAfterLaunch,
+                Disabled = source.Disabled
+            };
+        }
+
+        private static string RequiredString(Dictionary<string, object> values, string key, int maxLength)
+        {
+            object value;
+            if (!values.TryGetValue(key, out value))
+            {
+                throw new InvalidDataException("缺少字段：" + key);
+            }
+            return ValueString(value, key, maxLength);
+        }
+
+        private static string ValueString(object value, string name, int maxLength, bool allowEmpty)
+        {
+            string text = value as string;
+            if (text == null || (!allowEmpty && string.IsNullOrWhiteSpace(text)) || text.Length > maxLength)
+            {
+                throw new InvalidDataException(name + " 必须是长度不超过 " + maxLength + " 的字符串。");
+            }
+            return text.Trim();
+        }
+
+        private static string ValueString(object value, string name, int maxLength)
+        {
+            return ValueString(value, name, maxLength, false);
+        }
+
+        private static List<object> AsList(object value, string name)
+        {
+            var array = value as object[];
+            if (array != null) return array.ToList();
+            var list = value as System.Collections.ArrayList;
+            if (list != null) return list.Cast<object>().ToList();
+            throw new InvalidDataException(name + " 必须是数组。");
+        }
+
+        private static void EnsureKeys(Dictionary<string, object> values, string[] allowed, string name)
+        {
+            var allowedKeys = new HashSet<string>(allowed, StringComparer.Ordinal);
+            string unknown = values.Keys.FirstOrDefault(key => !allowedKeys.Contains(key));
+            if (unknown != null)
+            {
+                throw new InvalidDataException(name + " 不允许包含字段：" + unknown);
+            }
+            string missing = allowed.FirstOrDefault(key => !values.ContainsKey(key));
+            if (missing != null)
+            {
+                throw new InvalidDataException(name + " 缺少字段：" + missing);
+            }
+        }
+
+        private static string FieldDisplayName(string field)
+        {
+            var names = new Dictionary<string, string>
+            {
+                { "Name", "名称" }, { "Description", "说明" }, { "Tags", "标签" },
+                { "Executable", "程序" }, { "Arguments", "参数" },
+                { "WorkingDirectory", "工作目录" }, { "CloseAfterLaunch", "启动后关闭" }
+            };
+            string result;
+            return names.TryGetValue(field, out result) ? result : field;
+        }
+
+        private static string Redact(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return value;
+            string redacted = Regex.Replace(
+                value,
+                "(?i)(api[_-]?key|token|secret|password)(\\s*[:=]\\s*)([^\\s\\\"']+)",
+                "$1$2***"
+            );
+            return Regex.Replace(redacted, "(?i)Bearer\\s+[^\\s\\\"']+", "Bearer ***");
+        }
+    }
+
+    internal sealed class AiCommandEditorForm : Form
+    {
+        private readonly string sharedConfigPath;
+        private readonly string localConfigPath;
+        private readonly Label stepLabel;
+        private readonly Label instructionLabel;
+        private readonly TextBox inputBox;
+        private readonly Button primaryButton;
+        private readonly Button backButton;
+        private readonly Button undoButton;
+        private int step = 1;
+        private string originalRequest;
+        private string copiedFingerprint;
+        private AiCommandPatchPlan plan;
+
+        public AiCommandEditorForm(string sharedConfigPath, string localConfigPath)
+        {
+            this.sharedConfigPath = sharedConfigPath;
+            this.localConfigPath = localConfigPath;
+
+            Text = "AI 修改命令";
+            StartPosition = FormStartPosition.CenterParent;
+            Size = new Size(720, 610);
+            MinimumSize = new Size(620, 520);
+            BackColor = Color.FromArgb(244, 245, 239);
+            ForeColor = Color.FromArgb(23, 28, 24);
+            Font = new Font("Microsoft YaHei UI", 9F);
+            AutoScaleMode = AutoScaleMode.Dpi;
+
+            var root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 5,
+                Padding = new Padding(24, 20, 24, 20),
+                BackColor = BackColor
+            };
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 46F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 72F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 52F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 48F));
+
+            stepLabel = new Label
+            {
+                Dock = DockStyle.Fill,
+                Font = new Font("Consolas", 17F, FontStyle.Bold),
+                ForeColor = ForeColor
+            };
+            instructionLabel = new Label
+            {
+                Dock = DockStyle.Fill,
+                Font = new Font("Microsoft YaHei UI", 9.5F),
+                ForeColor = Color.FromArgb(91, 102, 94)
+            };
+            inputBox = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ScrollBars = ScrollBars.Vertical,
+                AcceptsReturn = true,
+                AcceptsTab = true,
+                BorderStyle = BorderStyle.FixedSingle,
+                BackColor = Color.FromArgb(255, 255, 252),
+                ForeColor = ForeColor,
+                Font = new Font("Microsoft YaHei UI", 10F)
+            };
+            var safetyLabel = new Label
+            {
+                Dock = DockStyle.Fill,
+                Text = "只修改个人 commands.local.json；应用前会严格校验并保留一次恢复备份。提示词会隐藏常见密钥，但发送前仍请自行确认。",
+                ForeColor = Color.FromArgb(91, 102, 94),
+                Font = new Font("Microsoft YaHei UI", 8.5F),
+                Padding = new Padding(0, 10, 0, 0)
+            };
+
+            var footer = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                Padding = new Padding(0, 8, 0, 0)
+            };
+            primaryButton = CreateButton("复制给 AI", true);
+            primaryButton.Click += PrimaryButton_Click;
+            backButton = CreateButton("上一步", false);
+            backButton.Click += BackButton_Click;
+            undoButton = CreateButton("恢复上次修改", false);
+            undoButton.Click += UndoButton_Click;
+            footer.Controls.Add(primaryButton);
+            footer.Controls.Add(backButton);
+            footer.Controls.Add(undoButton);
+
+            root.Controls.Add(stepLabel, 0, 0);
+            root.Controls.Add(instructionLabel, 0, 1);
+            root.Controls.Add(inputBox, 0, 2);
+            root.Controls.Add(safetyLabel, 0, 3);
+            root.Controls.Add(footer, 0, 4);
+            Controls.Add(root);
+            AcceptButton = primaryButton;
+            UpdateStep();
+        }
+
+        private static Button CreateButton(string text, bool primary)
+        {
+            var button = new Button
+            {
+                Text = text,
+                AutoSize = true,
+                Height = 34,
+                Padding = new Padding(12, 0, 12, 0),
+                Margin = new Padding(8, 0, 0, 0),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = primary ? Color.FromArgb(151, 179, 155) : Color.FromArgb(255, 255, 252),
+                ForeColor = Color.FromArgb(23, 28, 24),
+                Cursor = Cursors.Hand,
+                Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold)
+            };
+            button.FlatAppearance.BorderColor = Color.FromArgb(23, 28, 24);
+            button.FlatAppearance.BorderSize = 2;
+            return button;
+        }
+
+        private void PrimaryButton_Click(object sender, EventArgs eventArgs)
+        {
+            try
+            {
+                if (step == 1)
+                {
+                    originalRequest = inputBox.Text.Trim();
+                    copiedFingerprint = AiCommandPatchService.ComputeFingerprint(sharedConfigPath, localConfigPath);
+                    string prompt = AiCommandPatchService.BuildPrompt(originalRequest, sharedConfigPath);
+                    Clipboard.SetText(prompt);
+                    inputBox.Clear();
+                    step = 2;
+                    UpdateStep();
+                    return;
+                }
+
+                if (step == 2)
+                {
+                    string response = inputBox.Text.Trim();
+                    if (response.Length == 0 && Clipboard.ContainsText())
+                    {
+                        response = Clipboard.GetText().Trim();
+                    }
+                    plan = AiCommandPatchService.Prepare(
+                        response,
+                        sharedConfigPath,
+                        localConfigPath,
+                        copiedFingerprint
+                    );
+                    step = 3;
+                    inputBox.Text = string.Join(Environment.NewLine, plan.PreviewLines.Select((line, index) =>
+                        (index + 1).ToString(CultureInfo.InvariantCulture) + ". " + line));
+                    UpdateStep();
+                    return;
+                }
+
+                AiCommandPatchService.Apply(plan, sharedConfigPath, localConfigPath);
+                MessageBox.Show(this, "命令已更新。", "AI 修改命令", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                DialogResult = DialogResult.OK;
+                Close();
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show(this, exception.Message, "无法继续", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void BackButton_Click(object sender, EventArgs eventArgs)
+        {
+            if (step == 3)
+            {
+                step = 2;
+                inputBox.Clear();
+            }
+            else if (step == 2)
+            {
+                step = 1;
+                inputBox.Text = originalRequest ?? string.Empty;
+            }
+            UpdateStep();
+        }
+
+        private void UndoButton_Click(object sender, EventArgs eventArgs)
+        {
+            try
+            {
+                AiCommandPatchService.Undo(sharedConfigPath, localConfigPath);
+                MessageBox.Show(this, "已恢复到上一次 AI 修改前。", "AI 修改命令", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                DialogResult = DialogResult.OK;
+                Close();
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show(this, exception.Message, "无法恢复", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void UpdateStep()
+        {
+            backButton.Visible = step > 1;
+            undoButton.Visible = step == 1 && AiCommandPatchService.CanUndo(localConfigPath);
+            inputBox.ReadOnly = step == 3;
+            if (step == 1)
+            {
+                stepLabel.Text = "1 / 3  描述你要改什么";
+                instructionLabel.Text = "直接说人话，例如：新增一个在当前目录打开 Cursor 的命令；隐藏 VS Code；把 PowerShell 标签改成“终端”。";
+                primaryButton.Text = "复制给 AI";
+            }
+            else if (step == 2)
+            {
+                stepLabel.Text = "2 / 3  粘贴 AI 返回内容";
+                instructionLabel.Text = "提示词已复制。发给任意大模型，再把它返回的 JSON 粘贴到下方；留空时会直接读取剪贴板。";
+                primaryButton.Text = "解析并预览";
+            }
+            else
+            {
+                stepLabel.Text = "3 / 3  确认增量修改";
+                instructionLabel.Text = "这里只展示将发生的修改。确认后一次应用全部操作；任何一条不合法都不会写入。";
+                primaryButton.Text = "应用 " + plan.PreviewLines.Count.ToString(CultureInfo.InvariantCulture) + " 项修改";
+            }
+            inputBox.Focus();
+        }
+    }
+
     internal sealed class MainForm : Form
     {
         private readonly string appDirectory;
         private readonly string configPath;
         private readonly string contextPath;
-        private readonly IList<CommandItem> commands;
+        private List<CommandItem> commands;
         private readonly UsageTracker usageTracker;
         private readonly Color background = Color.FromArgb(244, 245, 239);
         private readonly Color surface = Color.FromArgb(255, 255, 252);
@@ -1448,6 +2270,7 @@ namespace CliListApp
         private FlowLayoutPanel commandList;
         private Panel commandListHost;
         private VScrollBar commandScrollBar;
+        private Button updateButton;
         private bool scrolling;
 
         // 拖动排序相关字段
@@ -1466,7 +2289,7 @@ namespace CliListApp
             this.configPath = configPath;
             this.contextPath = contextPath;
             // 应用保存的自定义排序
-            var orderedCommands = LoadCustomOrder(commands.ToList());
+            var orderedCommands = LoadCustomOrder(commands.Where(IsVisibleCommand).ToList());
             this.commands = orderedCommands;
             this.usageTracker = usageTracker;
 
@@ -2582,34 +3405,66 @@ namespace CliListApp
             var closeButton = CreateFooterButton("关闭");
             closeButton.Click += (sender, eventArgs) => Close();
 
-            var folderButton = CreateFooterButton("打开配置目录");
-            folderButton.Click += (sender, eventArgs) => Process.Start(new ProcessStartInfo
+            var aiEditButton = CreateFooterButton("AI 修改命令");
+            aiEditButton.Click += (sender, eventArgs) =>
             {
-                FileName = "explorer.exe",
-                Arguments = "\"" + appDirectory.TrimEnd(Path.DirectorySeparatorChar) + "\"",
-                UseShellExecute = true
-            });
-
-            var editButton = CreateFooterButton("编辑命令");
-            editButton.Click += (sender, eventArgs) =>
-            {
-                Program.EnsureLocalConfigFile(configPath);
-                Process.Start(new ProcessStartInfo
+                using (var editor = new AiCommandEditorForm(
+                    Path.Combine(appDirectory, "commands.json"),
+                    configPath
+                ))
                 {
-                    FileName = "notepad.exe",
-                    Arguments = "\"" + configPath + "\"",
-                    UseShellExecute = true
-                });
+                    if (editor.ShowDialog(this) == DialogResult.OK)
+                    {
+                        ReloadCommands();
+                    }
+                }
             };
 
-            var updateButton = CreateFooterButton("检查更新");
+            updateButton = CreateFooterButton("有新版本");
+            updateButton.Visible = false;
             updateButton.Click += (sender, eventArgs) => UpdateManager.CheckForUpdate(this, appDirectory);
 
             footer.Controls.Add(closeButton);
-            footer.Controls.Add(folderButton);
-            footer.Controls.Add(editButton);
+            footer.Controls.Add(aiEditButton);
             footer.Controls.Add(updateButton);
             return footer;
+        }
+
+        internal void ShowAvailableUpdate(string tagName)
+        {
+            updateButton.Text = "↑ 更新 " + tagName;
+            updateButton.Visible = true;
+        }
+
+        private static bool IsVisibleCommand(CommandItem command)
+        {
+            return !string.Equals(command.Action, "CheckUpdate", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private void ReloadCommands()
+        {
+            commands = LoadCustomOrder(Program.LoadCommands(Path.Combine(appDirectory, "commands.json"))
+                .Where(IsVisibleCommand)
+                .ToList());
+
+            tagFilter.BeginUpdate();
+            try
+            {
+                tagFilter.Items.Clear();
+                tagFilter.Items.Add("全部标签");
+                foreach (string tag in commands.SelectMany(command => command.Tags)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(tag => tag))
+                {
+                    tagFilter.Items.Add("# " + tag);
+                }
+                tagFilter.SelectedIndex = 0;
+            }
+            finally
+            {
+                tagFilter.EndUpdate();
+            }
+            RefreshCommandList();
         }
 
         private Button CreateFooterButton(string text)
