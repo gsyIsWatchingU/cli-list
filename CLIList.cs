@@ -150,17 +150,20 @@ namespace CliListApp
             string aiEditorScreenshotPath = GetOptionValue(args, "--screenshot-ai-editor");
             string browserScreenshotPath = GetOptionValue(args, "--screenshot-browser");
             string browserPickerScreenshotPath = GetOptionValue(args, "--screenshot-browser-picker");
+            string ideCliPickerScreenshotPath = GetOptionValue(args, "--screenshot-ide-cli-picker");
             string previewFilePath = GetOptionValue(args, "--preview-file");
             string aiPatchPath = GetOptionValue(args, "--apply-ai-patch");
             bool automatedMode = validateOnly || !string.IsNullOrWhiteSpace(screenshotPath) ||
                 !string.IsNullOrWhiteSpace(aiEditorScreenshotPath) || !string.IsNullOrWhiteSpace(aiPatchPath) ||
-                !string.IsNullOrWhiteSpace(browserScreenshotPath) || !string.IsNullOrWhiteSpace(browserPickerScreenshotPath);
+                !string.IsNullOrWhiteSpace(browserScreenshotPath) || !string.IsNullOrWhiteSpace(browserPickerScreenshotPath) ||
+                !string.IsNullOrWhiteSpace(ideCliPickerScreenshotPath);
 
             try
             {
                 string appDirectory = AppDomain.CurrentDomain.BaseDirectory;
                 string configPath = Path.Combine(appDirectory, "commands.json");
                 string usagePath = Path.Combine(appDirectory, "usage.json");
+                AiCommandPatchService.MigrateLegacyIdeCliCommand(configPath, GetLocalConfigPath(configPath));
 
                 if (validateOnly)
                 {
@@ -210,6 +213,13 @@ namespace CliListApp
                 {
                     var pickerForm = new BrowserPickerForm(appDirectory, contextPath);
                     RenderScreenshot(pickerForm, browserPickerScreenshotPath);
+                    return;
+                }
+
+                if (!string.IsNullOrWhiteSpace(ideCliPickerScreenshotPath))
+                {
+                    var pickerForm = new IdeCliPickerForm(appDirectory, contextPath);
+                    RenderScreenshot(pickerForm, ideCliPickerScreenshotPath);
                     return;
                 }
 
@@ -329,6 +339,12 @@ namespace CliListApp
                 }
 
                 if (string.Equals(args[index], "--screenshot-browser-picker", StringComparison.OrdinalIgnoreCase))
+                {
+                    index++;
+                    continue;
+                }
+
+                if (string.Equals(args[index], "--screenshot-ide-cli-picker", StringComparison.OrdinalIgnoreCase))
                 {
                     index++;
                     continue;
@@ -528,6 +544,7 @@ namespace CliListApp
 
                 bool isBuiltInAction = string.Equals(command.Action, "BrowsePowerShell", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(command.Action, "OpenBrowser", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(command.Action, "ChooseIdeOrCli", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(command.Action, "CheckUpdate", StringComparison.OrdinalIgnoreCase);
                 if (!command.Disabled && (string.IsNullOrWhiteSpace(command.Name) || (!isBuiltInAction && string.IsNullOrWhiteSpace(command.Executable))))
                 {
@@ -583,6 +600,7 @@ namespace CliListApp
             "commands.json",
             "commands.local.json",
             "commands.local.json.ai-last.bak",
+            "commands.local.json.pre-ide-cli-picker.bak",
             "commands.pre-shared-migration.json",
             "usage.json"
         };
@@ -1558,10 +1576,15 @@ namespace CliListApp
     {
         internal const int UserRequestMaxLength = 300;
         internal const int AiResponseMaxLength = 20000;
+        internal const string IdeCliPickerPresetId = "ide-cli-picker";
         private static readonly JavaScriptSerializer Serializer = new JavaScriptSerializer();
         private static readonly HashSet<string> EditableFields = new HashSet<string>(new[]
         {
             "Name", "Description", "Tags", "Executable", "Arguments", "WorkingDirectory", "CloseAfterLaunch"
+        }, StringComparer.Ordinal);
+        private static readonly HashSet<string> PresetEditableFields = new HashSet<string>(new[]
+        {
+            "Name", "Description", "Tags"
         }, StringComparer.Ordinal);
 
         public static string ComputeFingerprint(string sharedConfigPath, string localConfigPath)
@@ -1573,6 +1596,45 @@ namespace CliListApp
                 byte[] hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(shared + "\n--LOCAL--\n" + local));
                 return BitConverter.ToString(hash).Replace("-", string.Empty).ToLowerInvariant();
             }
+        }
+
+        public static bool MigrateLegacyIdeCliCommand(string sharedConfigPath, string localConfigPath)
+        {
+            if (!File.Exists(localConfigPath))
+            {
+                return false;
+            }
+
+            string originalJson = File.ReadAllText(localConfigPath);
+            List<CommandItem> commands = ReadLocalCommands(localConfigPath);
+            bool changed = false;
+            foreach (CommandItem command in commands)
+            {
+                if (!IsMissingLegacyIdeCliCommand(command, Path.GetDirectoryName(localConfigPath)))
+                {
+                    continue;
+                }
+
+                command.Action = "ChooseIdeOrCli";
+                command.Executable = null;
+                command.Arguments = string.Empty;
+                command.WorkingDirectory = string.Empty;
+                command.CloseAfterLaunch = false;
+                changed = true;
+            }
+            if (!changed)
+            {
+                return false;
+            }
+
+            ValidateProspective(sharedConfigPath, commands);
+            string migrationBackupPath = localConfigPath + ".pre-ide-cli-picker.bak";
+            if (!File.Exists(migrationBackupPath))
+            {
+                File.WriteAllText(migrationBackupPath, originalJson, new UTF8Encoding(false));
+            }
+            SaveLocalCommands(localConfigPath, commands, false);
+            return true;
         }
 
         public static string BuildPrompt(string request, string sharedConfigPath)
@@ -1621,9 +1683,10 @@ namespace CliListApp
             prompt.AppendLine(Serializer.Serialize(visibleCommands));
             prompt.AppendLine();
             prompt.AppendLine("只输出一个 JSON 对象，不要解释、不要 Markdown。格式必须是：");
-            prompt.AppendLine("{\"version\":1,\"ops\":[{\"op\":\"add\",\"fields\":{...}},{\"op\":\"update\",\"id\":\"现有Id\",\"fields\":{...}},{\"op\":\"delete\",\"id\":\"现有Id\"}]}");
+            prompt.AppendLine("{\"version\":1,\"ops\":[{\"op\":\"add\",\"fields\":{...}},{\"op\":\"add\",\"preset\":\"ide-cli-picker\",\"fields\":{...}},{\"op\":\"update\",\"id\":\"现有Id\",\"fields\":{...}},{\"op\":\"delete\",\"id\":\"现有Id\"}]}");
             prompt.AppendLine("规则：只保留必要操作，最多 10 条；add 不要提供 Id；update/delete 必须使用现有 Id；delete 表示从面板隐藏；不要修改 Id、Action、Disabled。");
-            prompt.AppendLine("fields 只允许 Name、Description、Tags、Executable、Arguments、WorkingDirectory、CloseAfterLaunch。add 必须包含 Name 和 Executable。内置 Action 命令只能修改 Name、Description、Tags。");
+            prompt.AppendLine("普通 add 的 fields 只允许 Name、Description、Tags、Executable、Arguments、WorkingDirectory、CloseAfterLaunch，并且必须包含 Name 和 Executable。内置 Action 命令只能修改 Name、Description、Tags。");
+            prompt.AppendLine("当用户要新增“选择 IDE 或 CLI”能力时，必须使用 preset=ide-cli-picker；其 fields 只允许 Name、Description、Tags。不要引用或虚构本机 .vbs、.ps1、.cmd、.bat 文件。");
             return prompt.ToString().Trim();
         }
 
@@ -1672,12 +1735,30 @@ namespace CliListApp
                 string operationName = RequiredString(operation, "op", 20).ToLowerInvariant();
                 if (operationName == "add")
                 {
-                    EnsureKeys(operation, new[] { "op", "fields" }, "add 操作");
+                    object presetValue;
+                    string presetId = operation.TryGetValue("preset", out presetValue) ? presetValue as string : null;
+                    bool usesPreset = !string.IsNullOrWhiteSpace(presetId);
+                    EnsureKeys(operation, usesPreset ? new[] { "op", "preset", "fields" } : new[] { "op", "fields" }, "add 操作");
                     Dictionary<string, object> fields = RequiredFields(operation);
-                    ValidateFieldKeys(fields);
-                    if (!fields.ContainsKey("Name") || !fields.ContainsKey("Executable"))
+                    if (usesPreset)
                     {
-                        throw new InvalidDataException("add 必须包含 Name 和 Executable。");
+                        if (!string.Equals(presetId, IdeCliPickerPresetId, StringComparison.Ordinal))
+                        {
+                            throw new InvalidDataException("不支持的内置能力 preset：" + presetId);
+                        }
+                        ValidatePresetFieldKeys(fields);
+                        if (merged.Any(command => string.Equals(command.Action, "ChooseIdeOrCli", StringComparison.OrdinalIgnoreCase)))
+                        {
+                            throw new InvalidDataException("“选择 IDE 或 CLI”命令已经存在，无需重复新增。");
+                        }
+                    }
+                    else
+                    {
+                        ValidateFieldKeys(fields);
+                        if (!fields.ContainsKey("Name") || !fields.ContainsKey("Executable"))
+                        {
+                            throw new InvalidDataException("普通 add 必须包含 Name 和 Executable。");
+                        }
                     }
 
                     string id;
@@ -1688,21 +1769,35 @@ namespace CliListApp
                     while (merged.Any(command => string.Equals(command.Id, id, StringComparison.OrdinalIgnoreCase)) ||
                            local.Any(command => string.Equals(command.Id, id, StringComparison.OrdinalIgnoreCase)));
 
-                    var added = new CommandItem
-                    {
-                        Id = id,
-                        Tags = new List<string>(),
-                        Arguments = string.Empty,
-                        WorkingDirectory = "{context}",
-                        CloseAfterLaunch = true
-                    };
+                    var added = usesPreset
+                        ? new CommandItem
+                        {
+                            Id = id,
+                            Name = "选择 IDE 或 CLI",
+                            Description = "选择 Codex、WorkBuddy、TRAE 或 Claude Code",
+                            Tags = new List<string> { "开发", "工具" },
+                            Action = "ChooseIdeOrCli",
+                            CloseAfterLaunch = false
+                        }
+                        : new CommandItem
+                        {
+                            Id = id,
+                            Tags = new List<string>(),
+                            Arguments = string.Empty,
+                            WorkingDirectory = "{context}",
+                            CloseAfterLaunch = true
+                        };
                     ApplyFields(added, fields);
+                    if (!usesPreset)
+                    {
+                        ValidateGeneratedCommandReferences(added, sharedConfigPath);
+                    }
                     local.Add(added);
                     merged.Add(added);
                     preview.Add(new AiCommandPatchPreviewItem
                     {
                         OperationLabel = "新增",
-                        Detail = "名称可编辑，其他配置保持不变",
+                        Detail = usesPreset ? "内置 IDE/CLI 选择器，名称可编辑" : "名称可编辑，其他配置保持不变",
                         EditableCommand = added
                     });
                     continue;
@@ -1764,6 +1859,10 @@ namespace CliListApp
 
                 CommandItem updated = Clone(target);
                 ApplyFields(updated, updateFields);
+                if (updateFields.Keys.Any(key => key == "Executable" || key == "Arguments" || key == "WorkingDirectory"))
+                {
+                    ValidateGeneratedCommandReferences(updated, sharedConfigPath);
+                }
                 if (localIndex >= 0)
                 {
                     local[localIndex] = updated;
@@ -1991,6 +2090,86 @@ namespace CliListApp
             {
                 throw new InvalidDataException("fields 不允许包含字段：" + unknown);
             }
+        }
+
+        private static void ValidatePresetFieldKeys(Dictionary<string, object> fields)
+        {
+            string unknown = fields.Keys.FirstOrDefault(key => !PresetEditableFields.Contains(key));
+            if (unknown != null)
+            {
+                throw new InvalidDataException("preset fields 不允许包含字段：" + unknown);
+            }
+        }
+
+        private static void ValidateGeneratedCommandReferences(CommandItem command, string sharedConfigPath)
+        {
+            string appDirectory = Path.GetDirectoryName(sharedConfigPath);
+            string executable = ExpandKnownPath(command.Executable, appDirectory);
+            if (!string.IsNullOrWhiteSpace(executable) && Path.IsPathRooted(executable) && !File.Exists(executable))
+            {
+                throw new InvalidDataException("AI 提议的程序不存在，因此没有应用本次修改：" + executable);
+            }
+
+            string arguments = command.Arguments ?? string.Empty;
+            var references = new List<string>();
+            foreach (Match match in Regex.Matches(arguments, "\"(?<path>[^\"]+\\.(?:vbs|ps1|cmd|bat))\"", RegexOptions.IgnoreCase))
+            {
+                references.Add(match.Groups["path"].Value);
+            }
+            foreach (Match match in Regex.Matches(arguments, @"(?<path>(?:%[^%]+%|[A-Za-z]:\\|\{appdir\})[^\s\x22]*\.(?:vbs|ps1|cmd|bat))", RegexOptions.IgnoreCase))
+            {
+                references.Add(match.Groups["path"].Value);
+            }
+
+            foreach (string reference in references.Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                string expanded = ExpandKnownPath(reference, appDirectory);
+                if (string.IsNullOrWhiteSpace(expanded) || expanded.IndexOf("{context}", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    continue;
+                }
+                if (!Path.IsPathRooted(expanded))
+                {
+                    expanded = Path.GetFullPath(Path.Combine(appDirectory, expanded));
+                }
+                if (!File.Exists(expanded))
+                {
+                    string suffix = expanded.EndsWith("ide-cli-launcher.vbs", StringComparison.OrdinalIgnoreCase)
+                        ? "。请使用 preset=ide-cli-picker 创建内置选择器"
+                        : string.Empty;
+                    throw new InvalidDataException("AI 提议引用的本机文件不存在，因此没有应用本次修改：" + expanded + suffix);
+                }
+            }
+        }
+
+        private static bool IsMissingLegacyIdeCliCommand(CommandItem command, string appDirectory)
+        {
+            if (command == null || !string.IsNullOrWhiteSpace(command.Action) ||
+                string.IsNullOrWhiteSpace(command.Arguments) ||
+                command.Arguments.IndexOf("ide-cli-launcher.vbs", StringComparison.OrdinalIgnoreCase) < 0)
+            {
+                return false;
+            }
+
+            Match match = Regex.Match(command.Arguments, "\"(?<path>[^\"]*ide-cli-launcher\\.vbs)\"", RegexOptions.IgnoreCase);
+            if (!match.Success)
+            {
+                return true;
+            }
+            string path = ExpandKnownPath(match.Groups["path"].Value, appDirectory);
+            return string.IsNullOrWhiteSpace(path) || !File.Exists(path);
+        }
+
+        private static string ExpandKnownPath(string value, string appDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return value;
+            }
+            return Environment.ExpandEnvironmentVariables(value)
+                .Replace("{appdir:q}", appDirectory)
+                .Replace("{appdir}", appDirectory)
+                .Trim().Trim('"');
         }
 
         private static void ApplyFields(CommandItem command, Dictionary<string, object> fields)
@@ -3785,6 +3964,19 @@ namespace CliListApp
                     return;
                 }
 
+                if (string.Equals(command.Action, "ChooseIdeOrCli", StringComparison.OrdinalIgnoreCase))
+                {
+                    using (var picker = new IdeCliPickerForm(appDirectory, contextPath))
+                    {
+                        if (picker.ShowDialog(this) == DialogResult.OK)
+                        {
+                            usageTracker.Record(command);
+                            RefreshCommandList();
+                        }
+                    }
+                    return;
+                }
+
                 if (string.Equals(command.Action, "CheckUpdate", StringComparison.OrdinalIgnoreCase))
                 {
                     usageTracker.Record(command);
@@ -3859,6 +4051,424 @@ namespace CliListApp
         private static string QuoteContextPath(string contextPath)
         {
             return "\"" + contextPath.Replace("\"", "\\\"") + "\"";
+        }
+    }
+
+    internal enum IdeCliLaunchKind
+    {
+        ShellTarget,
+        AppModelId,
+        TerminalCli
+    }
+
+    internal sealed class IdeCliToolInfo
+    {
+        public string Id { get; set; }
+        public string Name { get; set; }
+        public string Description { get; set; }
+        public string TargetPath { get; set; }
+        public string DetectionSource { get; set; }
+        public IdeCliLaunchKind LaunchKind { get; set; }
+
+        public bool IsAvailable
+        {
+            get { return !string.IsNullOrWhiteSpace(TargetPath); }
+        }
+    }
+
+    internal static class IdeCliToolLocator
+    {
+        private const string CodexPackageFamily = "OpenAI.Codex_2p2nqsd0c76g0";
+
+        public static List<IdeCliToolInfo> DetectTools()
+        {
+            List<string> shortcutRoots = GetShortcutRoots();
+            string codexPackageDirectory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Packages",
+                CodexPackageFamily
+            );
+            bool hasCodexApp = Directory.Exists(codexPackageDirectory);
+            string workBuddyShortcut = FindShortcut(shortcutRoots, new[] { "WorkBuddy.lnk" });
+            string traeShortcut = FindShortcut(shortcutRoots, new[] { "Trae CN.lnk", "TRAE.lnk", "Trae.lnk" });
+            string claudePath = FindExecutableOnPath("claude", GetPathDirectories(), GetPathExtensions());
+
+            return new List<IdeCliToolInfo>
+            {
+                new IdeCliToolInfo
+                {
+                    Id = "codex",
+                    Name = "Codex",
+                    Description = "打开 Codex 桌面应用",
+                    TargetPath = hasCodexApp ? "shell:AppsFolder\\" + CodexPackageFamily + "!App" : null,
+                    DetectionSource = hasCodexApp ? "Windows 应用" : "未检测到 Codex 桌面应用",
+                    LaunchKind = IdeCliLaunchKind.AppModelId
+                },
+                new IdeCliToolInfo
+                {
+                    Id = "workbuddy",
+                    Name = "WorkBuddy",
+                    Description = "打开 WorkBuddy 桌面应用",
+                    TargetPath = workBuddyShortcut,
+                    DetectionSource = workBuddyShortcut == null ? "未检测到 WorkBuddy" : "开始菜单",
+                    LaunchKind = IdeCliLaunchKind.ShellTarget
+                },
+                new IdeCliToolInfo
+                {
+                    Id = "trae",
+                    Name = "TRAE",
+                    Description = "打开 TRAE 桌面应用",
+                    TargetPath = traeShortcut,
+                    DetectionSource = traeShortcut == null ? "未检测到 TRAE" : "开始菜单",
+                    LaunchKind = IdeCliLaunchKind.ShellTarget
+                },
+                new IdeCliToolInfo
+                {
+                    Id = "claude",
+                    Name = "Claude Code",
+                    Description = "选择目录后在终端启动 Claude Code",
+                    TargetPath = claudePath,
+                    DetectionSource = claudePath == null ? "未在 PATH 中检测到 claude" : claudePath,
+                    LaunchKind = IdeCliLaunchKind.TerminalCli
+                }
+            };
+        }
+
+        internal static string FindShortcut(IEnumerable<string> roots, IEnumerable<string> candidateNames)
+        {
+            var names = new HashSet<string>(candidateNames, StringComparer.OrdinalIgnoreCase);
+            foreach (string root in roots.Where(Directory.Exists).Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    string match = Directory.EnumerateFiles(root, "*.lnk", SearchOption.AllDirectories)
+                        .FirstOrDefault(path => names.Contains(Path.GetFileName(path)));
+                    if (!string.IsNullOrWhiteSpace(match))
+                    {
+                        return match;
+                    }
+                }
+                catch (UnauthorizedAccessException)
+                {
+                }
+                catch (IOException)
+                {
+                }
+            }
+            return null;
+        }
+
+        internal static string FindExecutableOnPath(string commandName, IEnumerable<string> directories, string pathExtensions)
+        {
+            string[] extensions = (pathExtensions ?? ".EXE;.CMD;.BAT;.COM")
+                .Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(value => value.StartsWith(".", StringComparison.Ordinal) ? value : "." + value)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+            foreach (string directory in directories.Where(path => !string.IsNullOrWhiteSpace(path)).Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                string expandedDirectory = Environment.ExpandEnvironmentVariables(directory.Trim().Trim('"'));
+                if (!Directory.Exists(expandedDirectory))
+                {
+                    continue;
+                }
+                foreach (string extension in extensions)
+                {
+                    string candidate = Path.Combine(expandedDirectory, commandName + extension.ToLowerInvariant());
+                    if (File.Exists(candidate))
+                    {
+                        return candidate;
+                    }
+                    candidate = Path.Combine(expandedDirectory, commandName + extension.ToUpperInvariant());
+                    if (File.Exists(candidate))
+                    {
+                        return candidate;
+                    }
+                }
+            }
+            return null;
+        }
+
+        internal static ProcessStartInfo CreateTerminalStartInfo(string executablePath, string workingDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(executablePath) || !File.Exists(executablePath))
+            {
+                throw new FileNotFoundException("未找到 CLI 程序。", executablePath);
+            }
+            if (string.IsNullOrWhiteSpace(workingDirectory) || !Directory.Exists(workingDirectory))
+            {
+                throw new DirectoryNotFoundException("要打开的目录不存在：" + workingDirectory);
+            }
+
+            string commandProcessor = Environment.GetEnvironmentVariable("ComSpec");
+            if (string.IsNullOrWhiteSpace(commandProcessor) || !File.Exists(commandProcessor))
+            {
+                commandProcessor = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe");
+            }
+            return new ProcessStartInfo
+            {
+                FileName = commandProcessor,
+                Arguments = "/d /s /k \"\"" + executablePath.Replace("\"", "\"\"") + "\"\"",
+                WorkingDirectory = workingDirectory,
+                UseShellExecute = true
+            };
+        }
+
+        private static List<string> GetShortcutRoots()
+        {
+            return new[]
+            {
+                Environment.GetFolderPath(Environment.SpecialFolder.Programs),
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms)
+            }.Where(path => !string.IsNullOrWhiteSpace(path)).ToList();
+        }
+
+        private static List<string> GetPathDirectories()
+        {
+            var values = new List<string>();
+            foreach (EnvironmentVariableTarget target in new[]
+            {
+                EnvironmentVariableTarget.Process,
+                EnvironmentVariableTarget.User,
+                EnvironmentVariableTarget.Machine
+            })
+            {
+                try
+                {
+                    string path = Environment.GetEnvironmentVariable("PATH", target);
+                    if (!string.IsNullOrWhiteSpace(path))
+                    {
+                        values.AddRange(path.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries));
+                    }
+                }
+                catch (System.Security.SecurityException)
+                {
+                }
+            }
+            return values;
+        }
+
+        private static string GetPathExtensions()
+        {
+            string value = Environment.GetEnvironmentVariable("PATHEXT");
+            return string.IsNullOrWhiteSpace(value) ? ".COM;.EXE;.BAT;.CMD" : value;
+        }
+    }
+
+    internal sealed class IdeCliPickerForm : Form
+    {
+        private readonly string contextPath;
+        private readonly Color background = Color.FromArgb(244, 245, 239);
+        private readonly Color surface = Color.FromArgb(255, 255, 252);
+        private readonly Color surfaceHover = Color.FromArgb(226, 235, 224);
+        private readonly Color border = Color.FromArgb(23, 28, 24);
+        private readonly Color textPrimary = Color.FromArgb(23, 28, 24);
+        private readonly Color textSecondary = Color.FromArgb(91, 102, 94);
+        private readonly Color accent = Color.FromArgb(151, 179, 155);
+        private Label statusLabel;
+
+        public IdeCliPickerForm(string appDirectory, string contextPath)
+        {
+            this.contextPath = contextPath;
+            Text = "选择 IDE 或 CLI";
+            StartPosition = FormStartPosition.CenterParent;
+            MinimumSize = new Size(600, 480);
+            Size = new Size(700, 560);
+            BackColor = background;
+            ForeColor = textPrimary;
+            Font = new Font("Microsoft YaHei UI", 9F);
+            AutoScaleMode = AutoScaleMode.Dpi;
+
+            string iconPath = Path.Combine(appDirectory, "cli-list.ico");
+            if (File.Exists(iconPath))
+            {
+                Icon = new Icon(iconPath);
+            }
+            Controls.Add(CreateLayout(IdeCliToolLocator.DetectTools()));
+        }
+
+        private Control CreateLayout(List<IdeCliToolInfo> tools)
+        {
+            var root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 1,
+                RowCount = 3,
+                Padding = new Padding(20)
+            };
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 60F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 56F));
+
+            var header = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 1,
+                RowCount = 2,
+                Margin = new Padding(0, 0, 0, 8)
+            };
+            header.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
+            header.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            header.Controls.Add(new Label
+            {
+                Text = "[ DEV ]  选择 IDE 或 CLI",
+                Dock = DockStyle.Fill,
+                ForeColor = textPrimary,
+                BackColor = accent,
+                Font = new Font("Consolas", 11F, FontStyle.Bold),
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(10, 0, 0, 0)
+            }, 0, 0);
+            header.Controls.Add(new Label
+            {
+                Text = "当前目录： " + (string.IsNullOrWhiteSpace(contextPath) ? "（无）" : contextPath),
+                Dock = DockStyle.Fill,
+                ForeColor = textSecondary,
+                Font = new Font("Microsoft YaHei UI", 8.5F),
+                TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                Padding = new Padding(2, 0, 0, 0)
+            }, 0, 1);
+
+            var list = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoScroll = true,
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                BackColor = background,
+                Padding = new Padding(0, 4, 8, 4)
+            };
+            foreach (IdeCliToolInfo tool in tools)
+            {
+                list.Controls.Add(CreateToolButton(tool));
+            }
+
+            var footer = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 2,
+                RowCount = 1,
+                Padding = new Padding(0, 10, 0, 0)
+            };
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100F));
+            statusLabel = new Label
+            {
+                Dock = DockStyle.Fill,
+                ForeColor = textSecondary,
+                Font = new Font("Microsoft YaHei UI", 8.5F),
+                TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                Padding = new Padding(4, 0, 0, 4),
+                Text = "检测到 " + tools.Count(tool => tool.IsAvailable).ToString(CultureInfo.InvariantCulture) +
+                    " / " + tools.Count.ToString(CultureInfo.InvariantCulture) + " 个工具。"
+            };
+            var closeButton = CreateFooterButton("关闭");
+            closeButton.Click += (sender, eventArgs) => Close();
+            footer.Controls.Add(statusLabel, 0, 0);
+            footer.Controls.Add(closeButton, 1, 0);
+
+            root.Controls.Add(header, 0, 0);
+            root.Controls.Add(list, 0, 1);
+            root.Controls.Add(footer, 0, 2);
+            return root;
+        }
+
+        private Button CreateToolButton(IdeCliToolInfo tool)
+        {
+            string availability = tool.IsAvailable ? "已检测到" : tool.DetectionSource;
+            var button = new Button
+            {
+                Tag = tool,
+                Width = 600,
+                Height = 76,
+                Margin = new Padding(2, 3, 2, 5),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = surface,
+                ForeColor = tool.IsAvailable ? textPrimary : textSecondary,
+                Text = tool.Name + "  ·  " + availability + Environment.NewLine + tool.Description,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold),
+                Cursor = tool.IsAvailable ? Cursors.Hand : Cursors.Default,
+                Enabled = tool.IsAvailable,
+                UseVisualStyleBackColor = false
+            };
+            button.FlatAppearance.BorderColor = border;
+            button.FlatAppearance.BorderSize = 2;
+            button.FlatAppearance.MouseOverBackColor = surfaceHover;
+            button.Click += (sender, eventArgs) => LaunchTool(tool);
+            return button;
+        }
+
+        private Button CreateFooterButton(string text)
+        {
+            var button = new Button
+            {
+                Text = text,
+                Dock = DockStyle.Fill,
+                Height = 38,
+                Margin = new Padding(4),
+                ForeColor = textPrimary,
+                BackColor = surface,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+                Cursor = Cursors.Hand,
+                UseVisualStyleBackColor = false
+            };
+            button.FlatAppearance.BorderColor = border;
+            button.FlatAppearance.BorderSize = 2;
+            return button;
+        }
+
+        private void LaunchTool(IdeCliToolInfo tool)
+        {
+            try
+            {
+                if (tool.LaunchKind == IdeCliLaunchKind.TerminalCli)
+                {
+                    using (var dialog = new FolderBrowserDialog
+                    {
+                        Description = "选择要用 Claude Code 打开的目录",
+                        SelectedPath = Directory.Exists(contextPath) ? contextPath : Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                        ShowNewFolderButton = true
+                    })
+                    {
+                        if (dialog.ShowDialog(this) != DialogResult.OK)
+                        {
+                            statusLabel.Text = "已取消选择目录。";
+                            return;
+                        }
+                        Process.Start(IdeCliToolLocator.CreateTerminalStartInfo(tool.TargetPath, dialog.SelectedPath));
+                    }
+                }
+                else if (tool.LaunchKind == IdeCliLaunchKind.AppModelId)
+                {
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"),
+                        Arguments = tool.TargetPath,
+                        UseShellExecute = true
+                    });
+                }
+                else
+                {
+                    Process.Start(new ProcessStartInfo
+                    {
+                        FileName = tool.TargetPath,
+                        UseShellExecute = true
+                    });
+                }
+                DialogResult = DialogResult.OK;
+                Close();
+            }
+            catch (Exception exception)
+            {
+                statusLabel.Text = "启动失败：" + exception.Message;
+            }
         }
     }
 

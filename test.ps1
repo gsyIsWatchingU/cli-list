@@ -48,6 +48,15 @@ try {
         throw "本机命令覆盖配置验证失败，退出码：$($localConfigProcess.ExitCode)"
     }
 
+    $ideCliPickerScreenshotPath = Join-Path $temporaryDirectory 'ide-cli-picker.png'
+    $ideCliPickerProcess = Start-Process -FilePath (Join-Path $temporaryDirectory 'CLIList.exe') `
+        -ArgumentList @('--screenshot-ide-cli-picker', $ideCliPickerScreenshotPath) -Wait -PassThru
+    if ($ideCliPickerProcess.ExitCode -ne 0 -or
+        -not (Test-Path -LiteralPath $ideCliPickerScreenshotPath) -or
+        (Get-Item -LiteralPath $ideCliPickerScreenshotPath).Length -lt 1000) {
+        throw 'IDE/CLI 选择器没有正确渲染。'
+    }
+
     $sharedConfigHash = (Get-FileHash -LiteralPath (Join-Path $temporaryDirectory 'commands.json') -Algorithm SHA256).Hash
     $patchPath = Join-Path $temporaryDirectory 'ai-patch.json'
     @'
@@ -127,6 +136,33 @@ $serviceType.GetMethod('Apply').Invoke(
         throw '确认页名称编辑没有保留其他命令配置。'
     }
 
+    $presetPatchPath = Join-Path $temporaryDirectory 'ai-preset-patch.json'
+    '{"version":1,"ops":[{"op":"add","preset":"ide-cli-picker","fields":{"Name":"开发工具选择器"}}]}' |
+        Set-Content -LiteralPath $presetPatchPath -Encoding UTF8
+    $presetProcess = Start-Process -FilePath (Join-Path $temporaryDirectory 'CLIList.exe') `
+        -ArgumentList @('--apply-ai-patch', $presetPatchPath) -Wait -PassThru
+    if ($presetProcess.ExitCode -ne 0) {
+        throw "AI 内置选择器 preset 应用失败，退出码：$($presetProcess.ExitCode)"
+    }
+    $localCommands = @(Get-Content -LiteralPath $localConfigPath -Raw | ConvertFrom-Json)
+    $presetCommand = $localCommands | Where-Object Name -eq '开发工具选择器'
+    if (-not $presetCommand -or $presetCommand.Action -ne 'ChooseIdeOrCli' -or $presetCommand.Executable) {
+        throw 'AI preset 没有映射为受控的内置 IDE/CLI 选择器。'
+    }
+
+    $missingScriptHash = (Get-FileHash -LiteralPath $localConfigPath -Algorithm SHA256).Hash
+    $missingScriptPatchPath = Join-Path $temporaryDirectory 'ai-missing-script-patch.json'
+    '{"version":1,"ops":[{"op":"add","fields":{"Name":"无效脚本命令","Executable":"wscript.exe","Arguments":"//B \"%USERPROFILE%\\.cli-list\\missing-ai-test.vbs\""}}]}' |
+        Set-Content -LiteralPath $missingScriptPatchPath -Encoding UTF8
+    $missingScriptProcess = Start-Process -FilePath (Join-Path $temporaryDirectory 'CLIList.exe') `
+        -ArgumentList @('--apply-ai-patch', $missingScriptPatchPath) -Wait -PassThru
+    if ($missingScriptProcess.ExitCode -eq 0) {
+        throw 'AI 增量命令应拒绝引用不存在的本机脚本。'
+    }
+    if ((Get-FileHash -LiteralPath $localConfigPath -Algorithm SHA256).Hash -ne $missingScriptHash) {
+        throw '拒绝不存在的脚本后不应改写本机配置。'
+    }
+
     $localHashBeforeInvalidPatch = (Get-FileHash -LiteralPath (Join-Path $temporaryDirectory 'commands.local.json') -Algorithm SHA256).Hash
     $invalidPatchPath = Join-Path $temporaryDirectory 'ai-patch-invalid.json'
     '{"version":1,"ops":[{"op":"update","id":"open-powershell","fields":{"Id":"forbidden"}}]}' |
@@ -148,6 +184,25 @@ $serviceType.GetMethod('Apply').Invoke(
     }
     if ((Get-FileHash -LiteralPath (Join-Path $temporaryDirectory 'commands.local.json') -Algorithm SHA256).Hash -ne $localHashBeforeInvalidPatch) {
         throw '整份配置数组被拒绝后不应改写本机配置。'
+    }
+
+    $migrationDirectory = Join-Path $temporaryDirectory 'legacy-migration'
+    New-Item -ItemType Directory -Path $migrationDirectory | Out-Null
+    Copy-Item -LiteralPath $executablePath -Destination (Join-Path $migrationDirectory 'CLIList.exe')
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'commands.json') -Destination (Join-Path $migrationDirectory 'commands.json')
+    @'
+[{"Id":"legacy-picker","Name":"选择 IDE 或 CLI","Description":"旧配置","Tags":["开发"],"Executable":"%SystemRoot%\\System32\\wscript.exe","Arguments":"//B \"%USERPROFILE%\\.cli-list\\ide-cli-launcher.vbs\" \"{context}\"","WorkingDirectory":"{context}","CloseAfterLaunch":true}]
+'@ | Set-Content -LiteralPath (Join-Path $migrationDirectory 'commands.local.json') -Encoding UTF8
+    $migrationProcess = Start-Process -FilePath (Join-Path $migrationDirectory 'CLIList.exe') -ArgumentList '--validate' -Wait -PassThru
+    if ($migrationProcess.ExitCode -ne 0) {
+        throw "旧 IDE/CLI 命令迁移失败，退出码：$($migrationProcess.ExitCode)"
+    }
+    $migratedCommands = @(Get-Content -LiteralPath (Join-Path $migrationDirectory 'commands.local.json') -Raw | ConvertFrom-Json)
+    $migratedCommand = $migratedCommands | Where-Object Id -eq 'legacy-picker'
+    if (-not $migratedCommand -or $migratedCommand.Action -ne 'ChooseIdeOrCli' -or
+        $migratedCommand.Name -ne '选择 IDE 或 CLI' -or $migratedCommand.Executable -or
+        -not (Test-Path -LiteralPath (Join-Path $migrationDirectory 'commands.local.json.pre-ide-cli-picker.bak'))) {
+        throw '旧命令迁移没有保留身份与文案，或没有生成迁移备份。'
     }
 }
 finally {

@@ -92,6 +92,8 @@ git pull --ff-only
 
 应用只接受最多 10 条增量操作，不允许 AI 改写 `Id`、内置动作或整份配置。任何一条不合法都不会写入；修改仅保存到个人 `commands.local.json`，并提供一次恢复。
 
+“选择 IDE 或 CLI”属于受控内置能力。AI 只能申请 `ide-cli-picker` preset，由 CLI List 映射为内置选择器，不能虚构或创建本机脚本；引用不存在的 `.vbs`、`.ps1`、`.cmd`、`.bat` 文件会在应用前被拒绝。
+
 ### 高级配置
 
 仓库中的 `commands.json` 是多端共享配置。本机专用命令位于安装目录的 `commands.local.json`；同一 `Id` 会覆盖共享命令，新 `Id` 会追加命令，也可用 `Disabled` 隐藏共享命令。建议只在排查问题或开发共享默认值时手动编辑 JSON。
@@ -131,7 +133,7 @@ git pull --ff-only
 | `{appdir}` | CLI List 程序所在目录（原样替换） |
 | `{appdir:q}` | 同上，自动加双引号，适合引用安装目录内的辅助脚本 |
 
-内置动作 `BrowsePowerShell` 用于打开目录浏览与文件预览窗口；`OpenBrowser` 会列出本机已安装的浏览器供选择后启动。
+内置动作 `BrowsePowerShell` 用于打开目录浏览与文件预览窗口；`OpenBrowser` 会列出本机已安装的浏览器；`ChooseIdeOrCli` 会检测 Codex、WorkBuddy、TRAE 与 Claude Code，前三者直接启动，Claude Code 先选择工作目录再在终端中打开。
 `Id` 用于关联使用统计，应保持唯一且不要随意修改；`Tags` 用于搜索和标签筛选。`commands.local.json`、迁移备份和统计数据只保存在本机，不会上传。
 
 ## 卸载
