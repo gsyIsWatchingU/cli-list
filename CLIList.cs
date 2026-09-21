@@ -1154,7 +1154,9 @@ namespace CliListApp
         {
             commandList = new FlowLayoutPanel
             {
-                Dock = DockStyle.Top,
+                Dock = DockStyle.None,
+                Anchor = AnchorStyles.Left | AnchorStyles.Top | AnchorStyles.Right,
+                Location = Point.Empty,
                 BackColor = background,
                 FlowDirection = FlowDirection.TopDown,
                 WrapContents = false,
@@ -1693,6 +1695,7 @@ namespace CliListApp
             {
                 containerWidth = Math.Max(360, viewWidth - SystemInformation.VerticalScrollBarWidth);
                 _lastViewWidth = viewWidth;
+                commandList.Width = viewWidth;
             }
             else
             {
@@ -1754,13 +1757,16 @@ namespace CliListApp
 
             int contentHeight = commandList.Height;
             int maxScroll = Math.Max(0, contentHeight - viewportHeight);
+            int largeChange = Math.Max(1, viewportHeight);
 
             scrolling = true;
             try
             {
-                commandScrollBar.LargeChange = Math.Max(1, viewportHeight);
+                commandScrollBar.LargeChange = largeChange;
                 commandScrollBar.SmallChange = 30;
-                commandScrollBar.Maximum = maxScroll;
+                // WinForms 允许用户拖到的实际上限是 Maximum - LargeChange + 1。
+                // 因此 Maximum 必须包含视口跨度，否则滑块会在距离列表底部约一个视口处提前停下。
+                commandScrollBar.Maximum = maxScroll + largeChange - 1;
                 // 内容变短时把位置夹回合法范围，否则滑块会画出可视区之外。
                 commandScrollBar.Value = Math.Min(commandScrollBar.Value, maxScroll);
                 commandList.Top = -commandScrollBar.Value;
@@ -1821,6 +1827,8 @@ namespace CliListApp
             private readonly Color thumbHoverColor = Color.FromArgb(151, 179, 155);
 
             private bool hovering;
+            private bool draggingThumb;
+            private int dragOffset;
 
             public DrawerScrollBar()
             {
@@ -1842,6 +1850,61 @@ namespace CliListApp
                 hovering = false;
                 Invalidate();
                 base.OnMouseLeave(eventArgs);
+            }
+
+            protected override void OnMouseDown(MouseEventArgs eventArgs)
+            {
+                base.OnMouseDown(eventArgs);
+                if (eventArgs.Button != MouseButtons.Left)
+                {
+                    return;
+                }
+
+                Rectangle thumb = GetThumbRectangle();
+                if (thumb.Contains(eventArgs.Location))
+                {
+                    draggingThumb = true;
+                    dragOffset = eventArgs.Y - thumb.Top;
+                    Capture = true;
+                }
+                else
+                {
+                    SetInteractiveValue(Value + (eventArgs.Y < thumb.Top ? -LargeChange : LargeChange));
+                }
+            }
+
+            protected override void OnMouseMove(MouseEventArgs eventArgs)
+            {
+                base.OnMouseMove(eventArgs);
+                if (!draggingThumb)
+                {
+                    return;
+                }
+
+                Rectangle thumb = GetThumbRectangle();
+                int travel = Math.Max(1, Height - thumb.Height);
+                int thumbTop = Math.Max(0, Math.Min(travel, eventArgs.Y - dragOffset));
+                int maxScroll = InteractiveMaximum();
+                SetInteractiveValue((int)Math.Round((double)thumbTop / travel * maxScroll));
+            }
+
+            protected override void OnMouseUp(MouseEventArgs eventArgs)
+            {
+                if (eventArgs.Button == MouseButtons.Left)
+                {
+                    draggingThumb = false;
+                    Capture = false;
+                }
+                base.OnMouseUp(eventArgs);
+            }
+
+            protected override void OnMouseCaptureChanged(EventArgs eventArgs)
+            {
+                if (!Capture)
+                {
+                    draggingThumb = false;
+                }
+                base.OnMouseCaptureChanged(eventArgs);
             }
 
             protected override void OnPaint(PaintEventArgs eventArgs)
@@ -1867,15 +1930,27 @@ namespace CliListApp
                 int channelHeight = Math.Max(1, Height);
                 int minimumThumb = 28;
                 int visible = Math.Max(1, LargeChange);
-                int range = visible + Math.Max(0, Maximum);
+                int maxScroll = Math.Max(0, Maximum - LargeChange + 1);
+                int range = visible + maxScroll;
                 int thumbHeight = Math.Max(minimumThumb, (int)Math.Round((double)channelHeight * visible / range));
                 thumbHeight = Math.Min(thumbHeight, channelHeight);
 
                 int scrollable = Math.Max(1, channelHeight - thumbHeight);
-                int positionRange = Math.Max(1, Maximum);
+                int positionRange = Math.Max(1, maxScroll);
                 int offset = (int)Math.Round((double)Math.Min(Value, positionRange) / positionRange * scrollable);
 
                 return new Rectangle(1, Math.Min(offset, channelHeight - thumbHeight), Math.Max(1, Width - 2), thumbHeight);
+            }
+
+            private int InteractiveMaximum()
+            {
+                return Math.Max(Minimum, Maximum - LargeChange + 1);
+            }
+
+            private void SetInteractiveValue(int value)
+            {
+                Value = Math.Max(Minimum, Math.Min(InteractiveMaximum(), value));
+                Invalidate();
             }
         }
 
