@@ -14,6 +14,7 @@ cli-list-icon.png
 # 本地使用统计
 usage.json
 usage.json.tmp
+cli-list-error.log
 commands.local.json
 commands.pre-shared-migration.json
 

@@ -1,14 +1,17 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
+using System.IO.Compression;
 using System.IO.Pipes;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
@@ -16,8 +19,8 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("CLI List")]
 [assembly: AssemblyProduct("CLI List")]
-[assembly: AssemblyVersion("0.1.0")]
-[assembly: AssemblyFileVersion("0.1.0")]
+[assembly: AssemblyVersion("0.2.0")]
+[assembly: AssemblyFileVersion("0.2.0")]
 
 namespace CliListApp
 {
@@ -491,7 +494,8 @@ namespace CliListApp
                 }
 
                 bool isBuiltInAction = string.Equals(command.Action, "BrowsePowerShell", StringComparison.OrdinalIgnoreCase)
-                    || string.Equals(command.Action, "OpenBrowser", StringComparison.OrdinalIgnoreCase);
+                    || string.Equals(command.Action, "OpenBrowser", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(command.Action, "CheckUpdate", StringComparison.OrdinalIgnoreCase);
                 if (!command.Disabled && (string.IsNullOrWhiteSpace(command.Name) || (!isBuiltInAction && string.IsNullOrWhiteSpace(command.Executable))))
                 {
                     throw new InvalidDataException("每个命令都必须包含 Name，并提供 Executable 或受支持的 Action。 ");
@@ -535,6 +539,533 @@ namespace CliListApp
             }
 
             return fallback;
+        }
+    }
+
+    internal static class UpdateManager
+    {
+        private const string LatestReleaseUrl = "https://api.github.com/repos/gsyIsWatchingU/cli-list/releases/latest";
+        private static readonly string[] ProtectedFileNames =
+        {
+            "commands.json",
+            "commands.local.json",
+            "commands.pre-shared-migration.json",
+            "usage.json"
+        };
+
+        public static void CheckForUpdate(IWin32Window owner, string appDirectory)
+        {
+            string workDirectory = null;
+            string stageDirectory = null;
+            bool handedOff = false;
+
+            try
+            {
+                string installDirectory = Path.GetFullPath(appDirectory)
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                string sourceMarkerPath = Path.Combine(installDirectory, ".source-repository");
+                bool isSourceInstall = File.Exists(sourceMarkerPath);
+
+                if (!isSourceInstall && !Installer.IsProductInstallDirectory(installDirectory))
+                {
+                    throw new InvalidOperationException("请从已安装的 CLI List 中检查更新，不能直接更新源码目录或临时解压目录。");
+                }
+
+                System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)3072;
+                Dictionary<string, object> release = ReadLatestRelease();
+                string tagName = GetRequiredString(release, "tag_name", "Release 缺少版本号。");
+                if (!Regex.IsMatch(tagName, @"^v\d+\.\d+\.\d+$"))
+                {
+                    throw new InvalidDataException("GitHub Release 版本号格式无效：" + tagName);
+                }
+
+                Version currentVersion;
+                Version latestVersion;
+                if (!Version.TryParse(AppInfo.Version, out currentVersion) ||
+                    !Version.TryParse(tagName.Substring(1), out latestVersion))
+                {
+                    throw new InvalidDataException("无法比较当前版本与 GitHub Release 版本。");
+                }
+
+                if (latestVersion <= currentVersion)
+                {
+                    MessageBox.Show(
+                        owner,
+                        "当前已是最新版本 v" + AppInfo.Version + "。",
+                        "检查更新",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information
+                    );
+                    return;
+                }
+
+                DialogResult confirm = MessageBox.Show(
+                    owner,
+                    "发现新版本 " + tagName + "（当前 v" + AppInfo.Version + "）。" +
+                    Environment.NewLine + Environment.NewLine +
+                    "是否立即更新？程序会自动关闭，完成后重新启动。",
+                    "CLI List 更新",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question
+                );
+                if (confirm != DialogResult.Yes)
+                {
+                    return;
+                }
+
+                string helperSourcePath = Path.Combine(installDirectory, "update-helper.ps1");
+                if (!File.Exists(helperSourcePath))
+                {
+                    throw new FileNotFoundException("缺少更新组件，请重新下载安装最新版本。", helperSourcePath);
+                }
+
+                workDirectory = Path.Combine(Path.GetTempPath(), "cli-list-update-" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(workDirectory);
+                string helperPath = Path.Combine(workDirectory, "update-helper.ps1");
+                File.Copy(helperSourcePath, helperPath, true);
+
+                if (isSourceInstall)
+                {
+                    string sourceDirectory = File.ReadAllText(sourceMarkerPath).Trim().TrimStart('\uFEFF');
+                    if (string.IsNullOrWhiteSpace(sourceDirectory) ||
+                        (!Directory.Exists(Path.Combine(sourceDirectory, ".git")) &&
+                         !File.Exists(Path.Combine(sourceDirectory, ".git"))))
+                    {
+                        throw new InvalidDataException("源码安装标记无效，请重新运行 install.ps1。");
+                    }
+
+                    StartUpdateHelper(
+                        helperPath,
+                        "Source",
+                        installDirectory,
+                        null,
+                        null,
+                        sourceDirectory,
+                        workDirectory
+                    );
+                }
+                else
+                {
+                    Dictionary<string, object> asset = FindReleaseAsset(release, tagName);
+                    string downloadUrl = GetRequiredString(asset, "browser_download_url", "Release 安装包缺少下载地址。");
+                    object sizeValue;
+                    long expectedSize = asset.TryGetValue("size", out sizeValue)
+                        ? Convert.ToInt64(sizeValue, CultureInfo.InvariantCulture)
+                        : 0;
+                    if (expectedSize < 0 || expectedSize > 100 * 1024 * 1024)
+                    {
+                        throw new InvalidDataException("Release 安装包大小异常。");
+                    }
+
+                    string expectedHash = GetExpectedHash(asset, downloadUrl, workDirectory);
+
+                    string zipPath = Path.Combine(workDirectory, "update.zip");
+                    using (var client = CreateWebClient())
+                    {
+                        client.DownloadFile(downloadUrl, zipPath);
+                    }
+
+                    long actualSize = new FileInfo(zipPath).Length;
+                    if (actualSize <= 0 || actualSize > 100 * 1024 * 1024 ||
+                        (expectedSize > 0 && actualSize != expectedSize))
+                    {
+                        throw new InvalidDataException("更新包下载不完整，当前版本未做任何修改。");
+                    }
+
+                    string actualHash = ComputeSha256(zipPath);
+                    if (!string.Equals(actualHash, expectedHash, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidDataException("更新包校验失败，当前版本未做任何修改。");
+                    }
+
+                    string updateId = Guid.NewGuid().ToString("N");
+                    stageDirectory = installDirectory + ".__stage." + updateId;
+                    string backupDirectory = installDirectory + ".__backup";
+                    ExtractZipSafely(zipPath, stageDirectory);
+                    PreserveUserFiles(installDirectory, stageDirectory);
+                    ValidateStagedRelease(stageDirectory, latestVersion);
+
+                    StartUpdateHelper(
+                        helperPath,
+                        "Release",
+                        installDirectory,
+                        stageDirectory,
+                        backupDirectory,
+                        null,
+                        workDirectory
+                    );
+                }
+
+                handedOff = true;
+                Application.Exit();
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show(
+                    owner,
+                    "检查更新失败：" + Environment.NewLine + Environment.NewLine + exception.Message,
+                    "CLI List 更新",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error
+                );
+            }
+            finally
+            {
+                if (!handedOff)
+                {
+                    TryDeleteDirectory(stageDirectory);
+                    TryDeleteDirectory(workDirectory);
+                }
+            }
+        }
+
+        private static Dictionary<string, object> ReadLatestRelease()
+        {
+            try
+            {
+                string json;
+                using (var client = CreateWebClient())
+                {
+                    json = client.DownloadString(LatestReleaseUrl);
+                }
+
+                var serializer = new JavaScriptSerializer();
+                Dictionary<string, object> release = serializer.Deserialize<Dictionary<string, object>>(json);
+                if (release == null)
+                {
+                    throw new InvalidDataException("GitHub Release 返回内容无效。");
+                }
+                return release;
+            }
+            catch (System.Net.WebException)
+            {
+                return ReadLatestReleaseWithoutApi();
+            }
+        }
+
+        private static Dictionary<string, object> ReadLatestReleaseWithoutApi()
+        {
+            var request = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(
+                "https://github.com/gsyIsWatchingU/cli-list/releases/latest"
+            );
+            request.AllowAutoRedirect = true;
+            request.UserAgent = "cli-list/" + AppInfo.Version;
+            request.Timeout = 60000;
+
+            string tagName;
+            using (var response = (System.Net.HttpWebResponse)request.GetResponse())
+            {
+                string marker = "/releases/tag/";
+                string path = response.ResponseUri.AbsolutePath;
+                int markerIndex = path.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+                if (markerIndex < 0)
+                {
+                    throw new InvalidDataException("无法从 GitHub Release 页面识别最新版本。");
+                }
+                tagName = Uri.UnescapeDataString(path.Substring(markerIndex + marker.Length)).Trim('/');
+            }
+
+            string assetName = "cli-list-" + tagName + ".zip";
+            string downloadUrl = "https://github.com/gsyIsWatchingU/cli-list/releases/download/" +
+                Uri.EscapeDataString(tagName) + "/" + Uri.EscapeDataString(assetName);
+            var asset = new Dictionary<string, object>
+            {
+                { "name", assetName },
+                { "state", "uploaded" },
+                { "size", 0 },
+                { "browser_download_url", downloadUrl }
+            };
+            return new Dictionary<string, object>
+            {
+                { "tag_name", tagName },
+                { "assets", new System.Collections.ArrayList { asset } }
+            };
+        }
+
+        private static TimeoutWebClient CreateWebClient()
+        {
+            var client = new TimeoutWebClient(60000);
+            client.Headers.Add("User-Agent", "cli-list/" + AppInfo.Version);
+            client.Headers.Add("Accept", "application/vnd.github+json");
+            client.Headers.Add("X-GitHub-Api-Version", "2022-11-28");
+            return client;
+        }
+
+        private static Dictionary<string, object> FindReleaseAsset(Dictionary<string, object> release, string tagName)
+        {
+            object assetsValue;
+            var assets = release.TryGetValue("assets", out assetsValue)
+                ? assetsValue as System.Collections.ArrayList
+                : null;
+            if (assets == null)
+            {
+                throw new InvalidDataException("GitHub Release 缺少安装包列表。");
+            }
+
+            string expectedName = "cli-list-" + tagName + ".zip";
+            var matches = new List<Dictionary<string, object>>();
+            foreach (object item in assets)
+            {
+                var asset = item as Dictionary<string, object>;
+                if (asset == null)
+                {
+                    continue;
+                }
+
+                string name;
+                object nameValue;
+                object stateValue;
+                if (asset.TryGetValue("name", out nameValue) &&
+                    asset.TryGetValue("state", out stateValue))
+                {
+                    name = Convert.ToString(nameValue, CultureInfo.InvariantCulture);
+                    string state = Convert.ToString(stateValue, CultureInfo.InvariantCulture);
+                    if (string.Equals(name, expectedName, StringComparison.Ordinal) &&
+                        string.Equals(state, "uploaded", StringComparison.OrdinalIgnoreCase))
+                    {
+                        matches.Add(asset);
+                    }
+                }
+            }
+
+            if (matches.Count != 1)
+            {
+                throw new InvalidDataException("Release 中未找到唯一的安装包：" + expectedName);
+            }
+            return matches[0];
+        }
+
+        private static string GetRequiredString(Dictionary<string, object> values, string key, string errorMessage)
+        {
+            object value;
+            string result = values.TryGetValue(key, out value)
+                ? Convert.ToString(value, CultureInfo.InvariantCulture)
+                : null;
+            if (string.IsNullOrWhiteSpace(result))
+            {
+                throw new InvalidDataException(errorMessage);
+            }
+            return result;
+        }
+
+        private static string ComputeSha256(string filePath)
+        {
+            using (SHA256 sha256 = SHA256.Create())
+            using (FileStream stream = File.OpenRead(filePath))
+            {
+                return BitConverter.ToString(sha256.ComputeHash(stream)).Replace("-", string.Empty).ToLowerInvariant();
+            }
+        }
+
+        private static string GetExpectedHash(
+            Dictionary<string, object> asset,
+            string downloadUrl,
+            string workDirectory)
+        {
+            object digestValue;
+            string digest = asset.TryGetValue("digest", out digestValue)
+                ? Convert.ToString(digestValue, CultureInfo.InvariantCulture)
+                : null;
+            if (!string.IsNullOrWhiteSpace(digest) &&
+                digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase) &&
+                Regex.IsMatch(digest.Substring("sha256:".Length), "^[a-fA-F0-9]{64}$"))
+            {
+                return digest.Substring("sha256:".Length);
+            }
+
+            string checksumPath = Path.Combine(workDirectory, "update.zip.sha256");
+            using (var client = CreateWebClient())
+            {
+                client.DownloadFile(downloadUrl + ".sha256", checksumPath);
+            }
+            string[] checksumParts = File.ReadAllText(checksumPath)
+                .Trim()
+                .Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            string checksum = checksumParts.Length > 0 ? checksumParts[0] : string.Empty;
+            if (!Regex.IsMatch(checksum, "^[a-fA-F0-9]{64}$"))
+            {
+                throw new InvalidDataException("Release 安装包的 SHA-256 校验文件无效。");
+            }
+            return checksum;
+        }
+
+        private static void ExtractZipSafely(string zipPath, string destinationDirectory)
+        {
+            Directory.CreateDirectory(destinationDirectory);
+            string destinationRoot = Path.GetFullPath(destinationDirectory)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            int fileCount = 0;
+            long totalSize = 0;
+
+            using (FileStream stream = File.OpenRead(zipPath))
+            using (var archive = new ZipArchive(stream, ZipArchiveMode.Read, false))
+            {
+                foreach (ZipArchiveEntry entry in archive.Entries)
+                {
+                    string destinationPath = Path.GetFullPath(Path.Combine(destinationDirectory, entry.FullName));
+                    if (!destinationPath.StartsWith(destinationRoot, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidDataException("更新包包含不安全的文件路径。");
+                    }
+
+                    if (string.IsNullOrEmpty(entry.Name))
+                    {
+                        Directory.CreateDirectory(destinationPath);
+                        continue;
+                    }
+
+                    fileCount++;
+                    totalSize += entry.Length;
+                    if (fileCount > 1000 || totalSize > 200 * 1024 * 1024)
+                    {
+                        throw new InvalidDataException("更新包解压内容超出安全限制。");
+                    }
+
+                    string parentDirectory = Path.GetDirectoryName(destinationPath);
+                    if (!Directory.Exists(parentDirectory))
+                    {
+                        Directory.CreateDirectory(parentDirectory);
+                    }
+                    using (Stream input = entry.Open())
+                    using (FileStream output = new FileStream(destinationPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                    {
+                        input.CopyTo(output);
+                    }
+                }
+            }
+        }
+
+        private static void PreserveUserFiles(string installDirectory, string stageDirectory)
+        {
+            foreach (string fileName in ProtectedFileNames)
+            {
+                string sourcePath = Path.Combine(installDirectory, fileName);
+                if (File.Exists(sourcePath))
+                {
+                    File.Copy(sourcePath, Path.Combine(stageDirectory, fileName), true);
+                }
+            }
+        }
+
+        private static void ValidateStagedRelease(string stageDirectory, Version expectedVersion)
+        {
+            foreach (string fileName in new[] { "CLIList.exe", "commands.json", "cli-list.ico", "update-helper.ps1" })
+            {
+                if (!File.Exists(Path.Combine(stageDirectory, fileName)))
+                {
+                    throw new InvalidDataException("更新包缺少必要文件：" + fileName);
+                }
+            }
+
+            string executablePath = Path.Combine(stageDirectory, "CLIList.exe");
+            Version packageVersion = AssemblyName.GetAssemblyName(executablePath).Version;
+            if (packageVersion == null || packageVersion.ToString(3) != expectedVersion.ToString(3))
+            {
+                throw new InvalidDataException("更新包内程序版本与 Release 版本不一致。");
+            }
+
+            using (Process validation = Process.Start(new ProcessStartInfo
+            {
+                FileName = executablePath,
+                Arguments = "--validate",
+                WorkingDirectory = stageDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            }))
+            {
+                if (validation == null || !validation.WaitForExit(30000))
+                {
+                    if (validation != null)
+                    {
+                        validation.Kill();
+                    }
+                    throw new InvalidDataException("更新包验证超时。");
+                }
+                if (validation.ExitCode != 0)
+                {
+                    throw new InvalidDataException("更新包验证失败，退出码：" + validation.ExitCode);
+                }
+            }
+        }
+
+        private static void StartUpdateHelper(
+            string helperPath,
+            string mode,
+            string installDirectory,
+            string stageDirectory,
+            string backupDirectory,
+            string sourceDirectory,
+            string workDirectory)
+        {
+            var arguments = new StringBuilder();
+            arguments.Append("-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ").Append(QuoteArgument(helperPath));
+            arguments.Append(" -Mode ").Append(mode);
+            arguments.Append(" -CurrentDirectory ").Append(QuoteArgument(installDirectory));
+            arguments.Append(" -CurrentProcessId ").Append(Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture));
+            arguments.Append(" -WorkDirectory ").Append(QuoteArgument(workDirectory));
+            if (!string.IsNullOrWhiteSpace(stageDirectory))
+            {
+                arguments.Append(" -StageDirectory ").Append(QuoteArgument(stageDirectory));
+            }
+            if (!string.IsNullOrWhiteSpace(backupDirectory))
+            {
+                arguments.Append(" -BackupDirectory ").Append(QuoteArgument(backupDirectory));
+            }
+            if (!string.IsNullOrWhiteSpace(sourceDirectory))
+            {
+                arguments.Append(" -SourceDirectory ").Append(QuoteArgument(sourceDirectory));
+            }
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = arguments.ToString(),
+                WorkingDirectory = workDirectory,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+        }
+
+        private static string QuoteArgument(string value)
+        {
+            return "\"" + value.Replace("\"", "\\\"") + "\"";
+        }
+
+        private static void TryDeleteDirectory(string directoryPath)
+        {
+            if (string.IsNullOrWhiteSpace(directoryPath))
+            {
+                return;
+            }
+
+            try
+            {
+                if (Directory.Exists(directoryPath))
+                {
+                    Directory.Delete(directoryPath, true);
+                }
+            }
+            catch
+            {
+                // 清理失败不覆盖原始更新错误。
+            }
+        }
+
+        private sealed class TimeoutWebClient : System.Net.WebClient
+        {
+            private readonly int timeoutMilliseconds;
+
+            public TimeoutWebClient(int timeoutMilliseconds)
+            {
+                this.timeoutMilliseconds = timeoutMilliseconds;
+            }
+
+            protected override System.Net.WebRequest GetWebRequest(Uri address)
+            {
+                System.Net.WebRequest request = base.GetWebRequest(address);
+                request.Timeout = timeoutMilliseconds;
+                return request;
+            }
         }
     }
 
@@ -598,6 +1129,8 @@ namespace CliListApp
             openItem.Click += (sender, eventArgs) => ShowCommandPanel(null, false);
             var versionItem = new ToolStripMenuItem(AppInfo.DisplayName);
             versionItem.Enabled = false;
+            var updateItem = new ToolStripMenuItem("检查更新…");
+            updateItem.Click += (sender, eventArgs) => UpdateManager.CheckForUpdate(null, appDirectory);
             var uninstallItem = new ToolStripMenuItem("卸载 CLI List…");
             uninstallItem.Click += (sender, eventArgs) => UninstallFromTray();
             var exitItem = new ToolStripMenuItem("退出");
@@ -606,6 +1139,7 @@ namespace CliListApp
             trayMenu = new ContextMenuStrip();
             trayMenu.Items.Add(openItem);
             trayMenu.Items.Add(versionItem);
+            trayMenu.Items.Add(updateItem);
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add(uninstallItem);
             trayMenu.Items.Add(new ToolStripSeparator());
@@ -2068,9 +2602,13 @@ namespace CliListApp
                 });
             };
 
+            var updateButton = CreateFooterButton("检查更新");
+            updateButton.Click += (sender, eventArgs) => UpdateManager.CheckForUpdate(this, appDirectory);
+
             footer.Controls.Add(closeButton);
             footer.Controls.Add(folderButton);
             footer.Controls.Add(editButton);
+            footer.Controls.Add(updateButton);
             return footer;
         }
 
@@ -2127,6 +2665,14 @@ namespace CliListApp
                     {
                         picker.ShowDialog(this);
                     }
+                    return;
+                }
+
+                if (string.Equals(command.Action, "CheckUpdate", StringComparison.OrdinalIgnoreCase))
+                {
+                    usageTracker.Record(command);
+                    RefreshCommandList();
+                    UpdateManager.CheckForUpdate(this, appDirectory);
                     return;
                 }
 
@@ -3239,11 +3785,20 @@ namespace CliListApp
             }
         }
 
+        internal static bool IsProductInstallDirectory(string directoryPath)
+        {
+            string expected = Path.GetFullPath(InstallDirectory)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string actual = Path.GetFullPath(directoryPath)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return string.Equals(expected, actual, StringComparison.OrdinalIgnoreCase);
+        }
+
         public static void Install(string sourceDirectory)
         {
             Directory.CreateDirectory(InstallDirectory);
 
-            foreach (string fileName in new[] { "CLIList.exe", "cli-list.ico", "cli-list.svg", "commands.json", "minimize-all.vbs" })
+            foreach (string fileName in new[] { "CLIList.exe", "cli-list.ico", "cli-list.svg", "commands.json", "minimize-all.vbs", "update-helper.ps1" })
             {
                 string sourcePath = Path.Combine(sourceDirectory, fileName);
                 if (File.Exists(sourcePath))

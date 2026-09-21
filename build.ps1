@@ -50,6 +50,7 @@ if (-not $compilerPath) {
     "/win32icon:$iconPath" `
     "/reference:System.Windows.Forms.dll" `
     "/reference:System.Drawing.dll" `
+    "/reference:System.IO.Compression.dll" `
     "/reference:System.Web.Extensions.dll" `
     "/out:$outputPath" `
     $sourcePath

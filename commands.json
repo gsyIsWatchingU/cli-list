@@ -54,5 +54,13 @@
     "Arguments": "//B {appdir:q}\\minimize-all.vbs",
     "WorkingDirectory": "{context}",
     "CloseAfterLaunch": true
+  },
+  {
+    "Id": "check-update",
+    "Name": "检查更新",
+    "Description": "从 GitHub 下载最新版本并自动更新重启",
+    "Tags": ["系统", "更新"],
+    "Action": "CheckUpdate",
+    "CloseAfterLaunch": false
   }
 ]
