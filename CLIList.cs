@@ -19,8 +19,8 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("CLI List")]
 [assembly: AssemblyProduct("CLI List")]
-[assembly: AssemblyVersion("0.3.1")]
-[assembly: AssemblyFileVersion("0.3.1")]
+[assembly: AssemblyVersion("0.3.2")]
+[assembly: AssemblyFileVersion("0.3.2")]
 
 namespace CliListApp
 {
@@ -1548,6 +1548,21 @@ namespace CliListApp
         }
     }
 
+    internal sealed class AiCommandVersion
+    {
+        public string SavedAtUtc { get; set; }
+        public string Summary { get; set; }
+        public List<CommandItem> Commands { get; set; }
+    }
+
+    internal sealed class AiCommandVersionInfo
+    {
+        public string FilePath { get; set; }
+        public DateTime SavedAtUtc { get; set; }
+        public string Summary { get; set; }
+        public int CommandCount { get; set; }
+    }
+
     internal sealed class AiCommandPatchPreviewItem
     {
         public string OperationLabel { get; set; }
@@ -1577,6 +1592,7 @@ namespace CliListApp
         internal const int UserRequestMaxLength = 300;
         internal const int AiResponseMaxLength = 20000;
         internal const string IdeCliPickerPresetId = "ide-cli-picker";
+        internal const int MaxVersions = 5;
         private static readonly JavaScriptSerializer Serializer = new JavaScriptSerializer();
         private static readonly HashSet<string> EditableFields = new HashSet<string>(new[]
         {
@@ -2715,6 +2731,9 @@ namespace CliListApp
         private Button updateButton;
         private bool scrolling;
 
+        // 置顶命令列表（pins.json，最新的在最前）
+        private readonly List<string> pinnedKeys;
+
         // 拖动排序相关字段
         private Control dragSourceHandle;
         private Point dragStartPoint;
@@ -2733,6 +2752,7 @@ namespace CliListApp
             // 应用保存的自定义排序
             var orderedCommands = LoadCustomOrder(commands.Where(IsVisibleCommand).ToList());
             this.commands = orderedCommands;
+            this.pinnedKeys = LoadPinnedKeys();
             this.usageTracker = usageTracker;
 
             Text = AppInfo.DisplayName;
@@ -2980,6 +3000,21 @@ namespace CliListApp
                 AutoScroll = false
             };
             commandListHost.Controls.Add(commandList);
+
+            // Drag indicator overlays the host panel and never enters the FlowLayoutPanel flow,
+            // otherwise every DragOver would remove/re-add it and reflow the whole list (lag).
+            dragIndicator = new Panel
+            {
+                Height = 3,
+                Width = 360,
+                BackColor = accent,
+                Visible = false,
+                Margin = Padding.Empty
+            };
+            commandListHost.Controls.Add(dragIndicator);
+
+            EnableDoubleBuffering(commandList);
+            EnableDoubleBuffering(commandListHost);
             commandListHost.SizeChanged += (sender, eventArgs) => ResizeCommandCards();
             commandListHost.MouseWheel += CommandList_MouseWheel;
 
@@ -3021,22 +3056,31 @@ namespace CliListApp
             }
 
             List<CommandItem> visibleCommands = filtered.ToList();
+
+            // 置顶命令始终排在最前（按置顶顺序，最新置顶在最前），其余保持当前排序
+            List<CommandItem> pinnedCommands = visibleCommands.Where(IsPinned).ToList();
+            List<CommandItem> unpinnedCommands = visibleCommands.Where(command => !IsPinned(command)).ToList();
+            var orderedVisible = new List<CommandItem>();
+            var remainingPinned = new List<CommandItem>(pinnedCommands);
+            foreach (string key in pinnedKeys)
+            {
+                int index = remainingPinned.FindIndex(c => string.Equals(UsageTracker.GetKey(c), key, StringComparison.OrdinalIgnoreCase));
+                if (index >= 0)
+                {
+                    orderedVisible.Add(remainingPinned[index]);
+                    remainingPinned.RemoveAt(index);
+                }
+            }
+            orderedVisible.AddRange(remainingPinned);
+            orderedVisible.AddRange(unpinnedCommands);
+            visibleCommands = orderedVisible;
+
             commandList.SuspendLayout();
             commandList.Controls.Clear();
 
-            // 创建拖动指示线
-            dragIndicator = new Panel
-            {
-                Height = 3,
-                Width = CommandCardWidth(),
-                BackColor = accent,
-                Visible = false,
-                Margin = new Padding(0, 0, 0, 0)
-            };
 
             bool allowDrag = sortBox.SelectedIndex == 0 && string.IsNullOrEmpty(query) && selectedTag == null;
 
-            int commandIndex = 1;
             foreach (CommandItem command in visibleCommands)
             {
                 CommandUsage usage = usageTracker.Get(command);
@@ -3053,7 +3097,7 @@ namespace CliListApp
                 var button = new Button
                 {
                     Tag = command,
-                    Text = "  [" + commandIndex.ToString("00") + "]  " + command.Name + Environment.NewLine +
+                    Text = "  [" + command.Id + "]  " + command.Name + Environment.NewLine +
                            "      " + (command.Description ?? string.Empty) + Environment.NewLine +
                            "      " + tagText + "    " + usageText,
                     Dock = DockStyle.Fill,
@@ -3064,7 +3108,7 @@ namespace CliListApp
                     BackColor = surface,
                     FlatStyle = FlatStyle.Flat,
                     Font = new Font("Consolas", 10F, FontStyle.Bold),
-                    Cursor = Cursors.Hand,
+                    Cursor = allowDrag ? Cursors.SizeAll : Cursors.Hand,
                     UseVisualStyleBackColor = false
                 };
                 button.FlatAppearance.BorderSize = 0;
@@ -3085,7 +3129,32 @@ namespace CliListApp
                     Cursor = allowDrag ? Cursors.SizeAll : Cursors.Default
                 };
 
-                // 创建命令卡片容器（带拖动手柄）
+                // 一键置顶按钮（Dock.Right，加入顺序最后、最先参与停靠，位于卡片右侧）
+                bool isPinned = IsPinned(command);
+                CommandItem pinTarget = command;
+                var pinButton = new Button
+                {
+                    Tag = command,
+                    Text = isPinned ? "已置顶" : "置顶",
+                    Dock = DockStyle.Right,
+                    Width = 62,
+                    Margin = Padding.Empty,
+                    Padding = Padding.Empty,
+                    FlatStyle = FlatStyle.Flat,
+                    BackColor = isPinned ? accent : Color.FromArgb(240, 240, 235),
+                    ForeColor = textPrimary,
+                    Font = new Font("Microsoft YaHei UI", 8.5F, FontStyle.Regular),
+                    Cursor = Cursors.Hand,
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    UseVisualStyleBackColor = false
+                };
+                pinButton.FlatAppearance.BorderSize = 0;
+                pinButton.FlatAppearance.MouseOverBackColor = isPinned ? accent : surfaceHover;
+                pinButton.FlatAppearance.MouseDownBackColor = accent;
+                pinButton.Click += (sender, e) => TogglePin(pinTarget);
+                pinButton.MouseWheel += ForwardMouseWheel;
+
+                // 创建命令卡片容器（带拖动手柄和置顶按钮）
                 var cardPanel = new Panel
                 {
                     Height = 88,
@@ -3109,10 +3178,17 @@ namespace CliListApp
                     dragHandle.AllowDrop = true;
                     dragHandle.DragOver += (s, e) => CommandList_DragOver(s, e);
                     dragHandle.DragDrop += (s, e) => CommandList_DragDrop(s, e);
+
+                    // 整张卡片都可按住拖动（手柄只是视觉提示），5px 死区保证单击仍触发启动。
+                    button.MouseDown += CommandButton_MouseDown;
+                    button.MouseMove += CommandButton_MouseMove;
+                    cardPanel.MouseDown += CommandButton_MouseDown;
+                    cardPanel.MouseMove += CommandButton_MouseMove;
                 }
 
                 cardPanel.Controls.Add(button);
                 cardPanel.Controls.Add(dragHandle);
+                cardPanel.Controls.Add(pinButton);
 
                 // 滚轮落在卡片上时转发给列表滚动条，否则鼠标停在卡片区域滚不动。
                 cardPanel.MouseWheel += ForwardMouseWheel;
@@ -3120,7 +3196,6 @@ namespace CliListApp
                 dragHandle.MouseWheel += ForwardMouseWheel;
 
                 commandList.Controls.Add(cardPanel);
-                commandIndex++;
             }
 
             if (visibleCommands.Count == 0)
@@ -3214,6 +3289,13 @@ namespace CliListApp
             dragSourceHandle = null;
             isDragging = false;
             HideDragIndicator();
+        }
+
+        private static void EnableDoubleBuffering(Control control)
+        {
+            var prop = typeof(Control).GetProperty("DoubleBuffered",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (prop != null) { prop.SetValue(control, true, null); }
         }
 
         private void CommandList_DragOver(object sender, DragEventArgs e)
@@ -3325,13 +3407,7 @@ namespace CliListApp
         {
             if (dragIndicator == null) return;
 
-            // 移除已有的指示线
-            if (dragIndicator.Parent != null)
-            {
-                commandList.Controls.Remove(dragIndicator);
-            }
-
-            // 插入位置直接取缓存；越界（拖到列表末尾之后）时退化为「最后一张卡片的下沿」。
+            // Insert Y in list-local coords; out of range falls back to below the last card.
             int y = commandList.Padding.Top;
             if (commandCardTops.Count > 0)
             {
@@ -3344,12 +3420,16 @@ namespace CliListApp
                     y = commandCardTops[commandCardTops.Count - 1] + commandCardHeights[commandCardHeights.Count - 1];
                 }
             }
-            // 指示线用绝对值定位，不参与流式布局，所以宽度取可用内容宽度。
-            dragIndicator.Location = new Point(0, y - 2);
-            dragIndicator.Width = CommandCardWidth();
+            // commandList scrolls via a negative Top, so host Y = list-local y + commandList.Top.
+            int hostY = y - 2 + commandList.Top;
+            int indicatorWidth = CommandCardWidth();
+            if (dragIndicator.Visible && dragIndicator.Top == hostY && dragIndicator.Width == indicatorWidth)
+            {
+                return;
+            }
+            dragIndicator.Location = new Point(0, hostY);
+            dragIndicator.Width = indicatorWidth;
             dragIndicator.Visible = true;
-            dragIndicator.BringToFront();
-            commandList.Controls.Add(dragIndicator);
             dragIndicator.BringToFront();
         }
 
@@ -3359,7 +3439,6 @@ namespace CliListApp
             if (dragIndicator != null && dragIndicator.Parent != null)
             {
                 dragIndicator.Visible = false;
-                commandList.Controls.Remove(dragIndicator);
             }
             commandCardTops.Clear();
             commandCardHeights.Clear();
@@ -3449,6 +3528,73 @@ namespace CliListApp
             {
                 return defaultCommands;
             }
+        }
+
+        // ============== 一键置顶实现 ==============
+
+        private string GetPinsPath()
+        {
+            return Path.Combine(Path.GetDirectoryName(configPath), "pins.json");
+        }
+
+        private List<string> LoadPinnedKeys()
+        {
+            try
+            {
+                string pinsPath = GetPinsPath();
+                if (!File.Exists(pinsPath))
+                {
+                    return new List<string>();
+                }
+
+                string json = File.ReadAllText(pinsPath);
+                List<string> keys = new JavaScriptSerializer().Deserialize<List<string>>(json);
+                return keys == null ? new List<string>() : keys;
+            }
+            catch
+            {
+                return new List<string>();
+            }
+        }
+
+        private void SavePins()
+        {
+            try
+            {
+                string pinsPath = GetPinsPath();
+                string json = new JavaScriptSerializer().Serialize(pinnedKeys);
+                string temporaryPath = pinsPath + ".tmp";
+                File.WriteAllText(temporaryPath, json, new UTF8Encoding(false));
+                File.Copy(temporaryPath, pinsPath, true);
+                File.Delete(temporaryPath);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("保存置顶失败：" + ex.Message, "CLI List", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private bool IsPinned(CommandItem command)
+        {
+            string key = UsageTracker.GetKey(command);
+            return pinnedKeys.Any(pinned => string.Equals(pinned, key, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private void TogglePin(CommandItem command)
+        {
+            string key = UsageTracker.GetKey(command);
+            int existingIndex = pinnedKeys.FindIndex(pinned => string.Equals(pinned, key, StringComparison.OrdinalIgnoreCase));
+            if (existingIndex >= 0)
+            {
+                pinnedKeys.RemoveAt(existingIndex);
+            }
+            else
+            {
+                // 最新置顶的排在最前
+                pinnedKeys.Insert(0, key);
+            }
+            SavePins();
+            RefreshCommandList();
         }
 
         // ============== 拖动排序结束 ==============
@@ -4299,7 +4445,7 @@ namespace CliListApp
             };
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 60F));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 56F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 62F));
 
             var header = new TableLayoutPanel
             {
@@ -4352,7 +4498,7 @@ namespace CliListApp
                 BackColor = background,
                 ColumnCount = 2,
                 RowCount = 1,
-                Padding = new Padding(0, 10, 0, 0)
+                Padding = new Padding(0, 10, 0, 6)
             };
             footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             footer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100F));
@@ -4517,7 +4663,7 @@ namespace CliListApp
             root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             root.RowStyles.Add(new RowStyle(SizeType.Absolute, 58F));
             root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
-            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 56F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 62F));
             root.Controls.Add(CreateHeader(contextPath), 0, 0);
             root.Controls.Add(CreateBrowserList(), 0, 1);
             root.Controls.Add(CreateFooter(), 0, 2);
@@ -4633,7 +4779,7 @@ namespace CliListApp
                 BackColor = background,
                 ColumnCount = 2,
                 RowCount = 1,
-                Padding = new Padding(0, 10, 0, 0)
+                Padding = new Padding(0, 10, 0, 6)
             };
             footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
             footer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100F));

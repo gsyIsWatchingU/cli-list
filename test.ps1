@@ -14,7 +14,7 @@ foreach ($scriptPath in Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1'
     }
 }
 
-$sourceText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'CLIList.cs') -Raw
+$sourceText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'CLIList.cs') -Raw -Encoding UTF8
 if ($sourceText -notmatch 'BeginSilentCheck\(tagName\s*=>') {
     throw 'CLI List 启动流程缺少静默更新检查。'
 }
@@ -76,7 +76,7 @@ try {
         throw "AI 增量命令应用失败，退出码：$($patchProcess.ExitCode)"
     }
 
-    $localCommands = @(Get-Content -LiteralPath (Join-Path $temporaryDirectory 'commands.local.json') -Raw | ConvertFrom-Json)
+    $localCommands = Get-Content -LiteralPath (Join-Path $temporaryDirectory 'commands.local.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     $updatedCommand = $localCommands | Where-Object Id -eq 'open-powershell'
     $hiddenCommand = $localCommands | Where-Object Id -eq 'open-vscode'
     $addedCommand = $localCommands | Where-Object Name -eq '测试命令'
@@ -105,7 +105,7 @@ $ErrorActionPreference = 'Stop'
 $assembly = [Reflection.Assembly]::Load([IO.File]::ReadAllBytes($ExecutablePath))
 $serviceType = $assembly.GetType('CliListApp.AiCommandPatchService', $true)
 [string]$fingerprint = $serviceType.GetMethod('ComputeFingerprint').Invoke($null, [object[]]@($SharedConfigPath, $LocalConfigPath))
-[string]$patch = Get-Content -LiteralPath $PatchPath -Raw
+[string]$patch = Get-Content -LiteralPath $PatchPath -Raw -Encoding UTF8
 $plan = $serviceType.GetMethod('Prepare').Invoke($null, [object[]]@(
     $patch,
     $SharedConfigPath,
@@ -132,7 +132,7 @@ $serviceType.GetMethod('Apply').Invoke(
         throw "确认页名称编辑测试失败，退出码：$LASTEXITCODE"
     }
 
-    $localCommands = @(Get-Content -LiteralPath $localConfigPath -Raw | ConvertFrom-Json)
+    $localCommands = Get-Content -LiteralPath $localConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $renamedCommand = $localCommands | Where-Object Name -eq '确认页重命名'
     if (-not $renamedCommand -or $renamedCommand.Executable -ne 'cmd.exe') {
         throw '确认页名称编辑没有保留其他命令配置。'
@@ -146,7 +146,7 @@ $serviceType.GetMethod('Apply').Invoke(
     if ($presetProcess.ExitCode -ne 0) {
         throw "AI 内置选择器 preset 应用失败，退出码：$($presetProcess.ExitCode)"
     }
-    $localCommands = @(Get-Content -LiteralPath $localConfigPath -Raw | ConvertFrom-Json)
+    $localCommands = Get-Content -LiteralPath $localConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $presetCommand = $localCommands | Where-Object Name -eq '开发工具选择器'
     if (-not $presetCommand -or $presetCommand.Action -ne 'ChooseIdeOrCli' -or $presetCommand.Executable) {
         throw 'AI preset 没有映射为受控的内置 IDE/CLI 选择器。'
@@ -199,7 +199,7 @@ $serviceType.GetMethod('Apply').Invoke(
     if ($migrationProcess.ExitCode -ne 0) {
         throw "旧 IDE/CLI 命令迁移失败，退出码：$($migrationProcess.ExitCode)"
     }
-    $migratedCommands = @(Get-Content -LiteralPath (Join-Path $migrationDirectory 'commands.local.json') -Raw | ConvertFrom-Json)
+    $migratedCommands = Get-Content -LiteralPath (Join-Path $migrationDirectory 'commands.local.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     $migratedCommand = $migratedCommands | Where-Object Id -eq 'legacy-picker'
     if (-not $migratedCommand -or $migratedCommand.Action -ne 'ChooseIdeOrCli' -or
         $migratedCommand.Name -ne '选择 IDE 或 CLI' -or $migratedCommand.Executable -or
