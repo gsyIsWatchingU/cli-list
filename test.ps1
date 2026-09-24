@@ -152,6 +152,50 @@ $serviceType.GetMethod('Apply').Invoke(
         throw 'AI preset 没有映射为受控的内置 IDE/CLI 选择器。'
     }
 
+    $versionsDirectory = Join-Path $temporaryDirectory 'ai-versions'
+    $versionsBefore = @(Get-ChildItem -LiteralPath $versionsDirectory -Filter 'ai-*.json' -ErrorAction SilentlyContinue)
+    if ($versionsBefore.Count -lt 1) {
+        throw 'AI 修改后没有生成版本快照。'
+    }
+
+    for ($i = 0; $i -lt 6; $i++) {
+        $loopPatchPath = Join-Path $temporaryDirectory ("ai-loop-" + $i + ".json")
+        "{`"version`":1,`"ops`":[{`"op`":`"update`",`"id`":`"open-powershell`",`"fields`":{`"Description`":`"循环测试 $i`"}}]}" |
+            Set-Content -LiteralPath $loopPatchPath -Encoding UTF8
+        $loopProcess = Start-Process -FilePath (Join-Path $temporaryDirectory 'CLIList.exe') -ArgumentList @('--apply-ai-patch', $loopPatchPath) -Wait -PassThru
+        if ($loopProcess.ExitCode -ne 0) {
+            throw "版本历史循环应用第 $i 次失败。"
+        }
+    }
+    $versionsAfter = @(Get-ChildItem -LiteralPath $versionsDirectory -Filter 'ai-*.json')
+    if ($versionsAfter.Count -gt 5) {
+        throw "版本历史超过 5 个上限，当前 $($versionsAfter.Count) 个。"
+    }
+
+    $versionRestoreScriptPath = Join-Path $temporaryDirectory 'test-version-restore.ps1'
+    @'
+param(
+    [string]$ExecutablePath,
+    [string]$SharedConfigPath,
+    [string]$LocalConfigPath
+)
+$ErrorActionPreference = 'Stop'
+$assembly = [Reflection.Assembly]::Load([IO.File]::ReadAllBytes($ExecutablePath))
+$serviceType = $assembly.GetType('CliListApp.AiCommandPatchService', $true)
+$versions = $serviceType.GetMethod('ListVersions').Invoke($null, [object[]]@($LocalConfigPath))
+if (-not $versions -or $versions.Count -eq 0) { throw 'ListVersions 没有返回任何版本。' }
+$oldest = $versions[$versions.Count - 1]
+$serviceType.GetMethod('RestoreVersion').Invoke($null, [object[]]@(
+    $SharedConfigPath, $LocalConfigPath, $oldest.FilePath.PSObject.BaseObject
+)) | Out-Null
+'@ | Set-Content -LiteralPath $versionRestoreScriptPath -Encoding Unicode
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $versionRestoreScriptPath `
+    -ExecutablePath (Join-Path $temporaryDirectory 'CLIList.exe') `
+    -SharedConfigPath $sharedConfigPath -LocalConfigPath $localConfigPath
+if ($LASTEXITCODE -ne 0) {
+    throw "版本恢复测试失败，退出码：$LASTEXITCODE"
+}
+
     $missingScriptHash = (Get-FileHash -LiteralPath $localConfigPath -Algorithm SHA256).Hash
     $missingScriptPatchPath = Join-Path $temporaryDirectory 'ai-missing-script-patch.json'
     '{"version":1,"ops":[{"op":"add","fields":{"Name":"无效脚本命令","Executable":"wscript.exe","Arguments":"//B \"%USERPROFILE%\\.cli-list\\missing-ai-test.vbs\""}}]}' |

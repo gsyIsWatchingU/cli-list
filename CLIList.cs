@@ -1028,6 +1028,17 @@ namespace CliListApp
                     File.Copy(sourcePath, Path.Combine(stageDirectory, fileName), true);
                 }
             }
+
+            string versionsDirectory = Path.Combine(installDirectory, "ai-versions");
+            if (Directory.Exists(versionsDirectory))
+            {
+                string stagedVersionsDirectory = Path.Combine(stageDirectory, "ai-versions");
+                Directory.CreateDirectory(stagedVersionsDirectory);
+                foreach (string file in Directory.EnumerateFiles(versionsDirectory))
+                {
+                    File.Copy(file, Path.Combine(stagedVersionsDirectory, Path.GetFileName(file)), true);
+                }
+            }
         }
 
         private static void ValidateStagedRelease(string stageDirectory, Version expectedVersion)
@@ -1649,7 +1660,7 @@ namespace CliListApp
             {
                 File.WriteAllText(migrationBackupPath, originalJson, new UTF8Encoding(false));
             }
-            SaveLocalCommands(localConfigPath, commands, false);
+            SaveLocalCommands(localConfigPath, commands);
             return true;
         }
 
@@ -1950,26 +1961,172 @@ namespace CliListApp
             }
 
             ValidateProspective(sharedConfigPath, plan.LocalCommands);
-            SaveLocalCommands(localConfigPath, plan.LocalCommands, true);
+            MigrateLegacyBackup(localConfigPath);
+            SnapshotCurrentState(localConfigPath, BuildChangeSummary(plan));
+            SaveLocalCommands(localConfigPath, plan.LocalCommands);
         }
 
-        public static bool CanUndo(string localConfigPath)
+        public static List<AiCommandVersionInfo> ListVersions(string localConfigPath)
         {
-            return File.Exists(GetBackupPath(localConfigPath));
-        }
-
-        public static void Undo(string sharedConfigPath, string localConfigPath)
-        {
-            string backupPath = GetBackupPath(localConfigPath);
-            if (!File.Exists(backupPath))
+            MigrateLegacyBackup(localConfigPath);
+            var result = new List<AiCommandVersionInfo>();
+            string directory = GetVersionsDirectory(localConfigPath);
+            if (!Directory.Exists(directory))
             {
-                throw new InvalidOperationException("没有可恢复的上一次 AI 修改。");
+                return result;
             }
-            List<CommandItem> previous = Serializer.Deserialize<List<CommandItem>>(File.ReadAllText(backupPath));
-            previous = previous ?? new List<CommandItem>();
-            ValidateProspective(sharedConfigPath, previous);
-            SaveLocalCommands(localConfigPath, previous, false);
-            File.Delete(backupPath);
+
+            foreach (string path in Directory.EnumerateFiles(directory, "ai-*.json")
+                .OrderByDescending(candidate => Path.GetFileName(candidate)))
+            {
+                try
+                {
+                    var version = Serializer.Deserialize<AiCommandVersion>(File.ReadAllText(path));
+                    if (version == null)
+                    {
+                        continue;
+                    }
+                    DateTime savedAt;
+                    DateTime.TryParse(
+                        version.SavedAtUtc,
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                        out savedAt);
+                    result.Add(new AiCommandVersionInfo
+                    {
+                        FilePath = path,
+                        SavedAtUtc = savedAt,
+                        Summary = version.Summary ?? string.Empty,
+                        CommandCount = version.Commands == null ? 0 : version.Commands.Count
+                    });
+                }
+                catch
+                {
+                    // skip corrupted version files
+                }
+            }
+            return result;
+        }
+
+        public static void RestoreVersion(string sharedConfigPath, string localConfigPath, string versionPath)
+        {
+            if (string.IsNullOrEmpty(versionPath) || !File.Exists(versionPath))
+            {
+                throw new InvalidOperationException("找不到要恢复的版本文件。");
+            }
+            var version = Serializer.Deserialize<AiCommandVersion>(File.ReadAllText(versionPath));
+            if (version == null || version.Commands == null)
+            {
+                throw new InvalidDataException("版本记录已损坏，无法恢复。");
+            }
+            ValidateProspective(sharedConfigPath, version.Commands);
+            MigrateLegacyBackup(localConfigPath);
+            // snapshot current state first so switching back is possible
+            SnapshotCurrentState(localConfigPath, "恢复前的当前配置");
+            SaveLocalCommands(localConfigPath, version.Commands);
+        }
+
+        private static string GetVersionsDirectory(string localConfigPath)
+        {
+            return Path.Combine(Path.GetDirectoryName(localConfigPath), "ai-versions");
+        }
+
+        private static void SnapshotCurrentState(string localConfigPath, string summary)
+        {
+            try
+            {
+                string directory = GetVersionsDirectory(localConfigPath);
+                Directory.CreateDirectory(directory);
+                string previous = File.Exists(localConfigPath) ? File.ReadAllText(localConfigPath) : "[]";
+                var version = new AiCommandVersion
+                {
+                    SavedAtUtc = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
+                    Summary = string.IsNullOrWhiteSpace(summary) ? "AI 修改前的配置" : summary,
+                    Commands = Serializer.Deserialize<List<CommandItem>>(previous) ?? new List<CommandItem>()
+                };
+                string fileName = "ai-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)
+                    + "-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".json";
+                File.WriteAllText(
+                    Path.Combine(directory, fileName),
+                    Serializer.Serialize(version),
+                    new UTF8Encoding(false));
+                PruneVersions(directory);
+            }
+            catch
+            {
+                // best effort: history recording must not block the patch itself
+            }
+        }
+
+        private static void PruneVersions(string directory)
+        {
+            var stale = Directory.EnumerateFiles(directory, "ai-*.json")
+                .OrderByDescending(path => Path.GetFileName(path))
+                .Skip(MaxVersions)
+                .ToList();
+            foreach (string path in stale)
+            {
+                try { File.Delete(path); }
+                catch { }
+            }
+        }
+
+        private static void MigrateLegacyBackup(string localConfigPath)
+        {
+            string legacyPath = localConfigPath + ".ai-last.bak";
+            if (!File.Exists(legacyPath))
+            {
+                return;
+            }
+            try
+            {
+                string directory = GetVersionsDirectory(localConfigPath);
+                Directory.CreateDirectory(directory);
+                var version = new AiCommandVersion
+                {
+                    SavedAtUtc = File.GetLastWriteTimeUtc(legacyPath).ToString("o", CultureInfo.InvariantCulture),
+                    Summary = "上一次 AI 修改前的配置",
+                    Commands = Serializer.Deserialize<List<CommandItem>>(File.ReadAllText(legacyPath))
+                        ?? new List<CommandItem>()
+                };
+                string fileName = "ai-" + DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)
+                    + "-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".json";
+                File.WriteAllText(
+                    Path.Combine(directory, fileName),
+                    Serializer.Serialize(version),
+                    new UTF8Encoding(false));
+                File.Delete(legacyPath);
+                PruneVersions(directory);
+            }
+            catch
+            {
+                // keep legacy file if migration fails
+            }
+        }
+
+        private static string BuildChangeSummary(AiCommandPatchPlan plan)
+        {
+            var parts = new List<string>();
+            foreach (var group in plan.PreviewItems
+                .GroupBy(item => item.OperationLabel)
+                .OrderBy(group => group.Key))
+            {
+                string label = group.Key + " " + group.Count() + " 项";
+                var names = group.Select(item => item.Name)
+                    .Where(name => !string.IsNullOrWhiteSpace(name))
+                    .Take(3)
+                    .ToList();
+                if (names.Count > 0)
+                {
+                    label += "：" + string.Join("、", names);
+                    if (group.Count() > 3)
+                    {
+                        label += " 等";
+                    }
+                }
+                parts.Add(label);
+            }
+            return string.Join("；", parts);
         }
 
         private static Dictionary<string, object> ParseRoot(string response)
@@ -2035,19 +2192,13 @@ namespace CliListApp
             }
         }
 
-        private static void SaveLocalCommands(string localConfigPath, List<CommandItem> commands, bool createBackup)
+        private static void SaveLocalCommands(string localConfigPath, List<CommandItem> commands)
         {
             string directory = Path.GetDirectoryName(localConfigPath);
             if (!Directory.Exists(directory))
             {
                 Directory.CreateDirectory(directory);
             }
-            if (createBackup)
-            {
-                string previous = File.Exists(localConfigPath) ? File.ReadAllText(localConfigPath) : "[]";
-                File.WriteAllText(GetBackupPath(localConfigPath), previous, new UTF8Encoding(false));
-            }
-
             string temporaryPath = localConfigPath + ".ai-" + Guid.NewGuid().ToString("N") + ".tmp";
             File.WriteAllText(temporaryPath, Serializer.Serialize(commands), new UTF8Encoding(false));
             try
@@ -2081,11 +2232,6 @@ namespace CliListApp
                     File.Delete(temporaryPath);
                 }
             }
-        }
-
-        private static string GetBackupPath(string localConfigPath)
-        {
-            return localConfigPath + ".ai-last.bak";
         }
 
         private static Dictionary<string, object> RequiredFields(Dictionary<string, object> operation)
@@ -2315,7 +2461,7 @@ namespace CliListApp
         private readonly Label characterLimitLabel;
         private readonly Button primaryButton;
         private readonly Button backButton;
-        private readonly Button undoButton;
+        private readonly Button historyButton;
         private int step = 1;
         private string originalRequest;
         private string copiedFingerprint;
@@ -2417,7 +2563,7 @@ namespace CliListApp
             var safetyLabel = new Label
             {
                 Dock = DockStyle.Fill,
-                Text = "只修改个人 commands.local.json；应用前会严格校验并保留一次恢复备份。提示词会隐藏常见密钥，但发送前仍请自行确认。",
+                Text = "只修改个人 commands.local.json；每次应用前会自动留存版本快照，最多保留最近 5 个，可在“版本历史”中来回切换。提示词会隐藏常见密钥，但发送前仍请自行确认。",
                 ForeColor = Color.FromArgb(91, 102, 94),
                 Font = new Font("Microsoft YaHei UI", 8.5F),
                 Padding = new Padding(0, 10, 0, 0)
@@ -2434,11 +2580,11 @@ namespace CliListApp
             primaryButton.Click += PrimaryButton_Click;
             backButton = CreateButton("上一步", false);
             backButton.Click += BackButton_Click;
-            undoButton = CreateButton("恢复上次修改", false);
-            undoButton.Click += UndoButton_Click;
+            historyButton = CreateButton("版本历史", false);
+            historyButton.Click += HistoryButton_Click;
             footer.Controls.Add(primaryButton);
             footer.Controls.Add(backButton);
-            footer.Controls.Add(undoButton);
+            footer.Controls.Add(historyButton);
 
             root.Controls.Add(stepLabel, 0, 0);
             root.Controls.Add(instructionLabel, 0, 1);
@@ -2537,25 +2683,24 @@ namespace CliListApp
             UpdateStep();
         }
 
-        private void UndoButton_Click(object sender, EventArgs eventArgs)
+        private void HistoryButton_Click(object sender, EventArgs eventArgs)
         {
-            try
+            using (var history = new AiCommandHistoryForm(sharedConfigPath, localConfigPath))
             {
-                AiCommandPatchService.Undo(sharedConfigPath, localConfigPath);
-                MessageBox.Show(this, "已恢复到上一次 AI 修改前。", "AI 修改命令", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                DialogResult = DialogResult.OK;
-                Close();
-            }
-            catch (Exception exception)
-            {
-                MessageBox.Show(this, exception.Message, "无法恢复", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                if (history.ShowDialog(this) == DialogResult.OK)
+                {
+                    DialogResult = DialogResult.OK;
+                    Close();
+                }
             }
         }
 
         private void UpdateStep()
         {
             backButton.Visible = step > 1;
-            undoButton.Visible = step == 1 && AiCommandPatchService.CanUndo(localConfigPath);
+            int versionCount = step == 1 ? AiCommandPatchService.ListVersions(localConfigPath).Count : 0;
+            historyButton.Visible = step == 1;
+            historyButton.Text = "版本历史" + (versionCount > 0 ? " (" + versionCount + ")" : string.Empty);
             inputBox.Visible = step < 3;
             previewList.Visible = step == 3;
             if (step == 3)
@@ -2707,6 +2852,181 @@ namespace CliListApp
         }
     }
 
+    internal sealed class AiCommandHistoryForm : Form
+    {
+        private readonly string sharedConfigPath;
+        private readonly string localConfigPath;
+        private readonly FlowLayoutPanel versionList;
+
+        public AiCommandHistoryForm(string sharedConfigPath, string localConfigPath)
+        {
+            this.sharedConfigPath = sharedConfigPath;
+            this.localConfigPath = localConfigPath;
+
+            Text = "AI 修改 · 版本历史";
+            StartPosition = FormStartPosition.CenterParent;
+            Size = new Size(680, 460);
+            MinimumSize = new Size(560, 360);
+            BackColor = Color.FromArgb(244, 245, 239);
+            ForeColor = Color.FromArgb(23, 28, 24);
+            Font = new Font("Microsoft YaHei UI", 9F);
+            AutoScaleMode = AutoScaleMode.Dpi;
+
+            var root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 1,
+                RowCount = 3,
+                Padding = new Padding(20, 16, 20, 16),
+                BackColor = BackColor
+            };
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 56F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44F));
+
+            var introLabel = new Label
+            {
+                Dock = DockStyle.Fill,
+                Text = "最近 " + AiCommandPatchService.MaxVersions + " 个版本，最新在前。恢复前会自动保存当前配置，可来回切换。",
+                ForeColor = Color.FromArgb(91, 102, 94),
+                Font = new Font("Microsoft YaHei UI", 9F)
+            };
+
+            versionList = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoScroll = true,
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                BackColor = BackColor,
+                Padding = new Padding(0, 0, 4, 0)
+            };
+
+            var footer = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.RightToLeft,
+                WrapContents = false,
+                Padding = new Padding(0, 6, 0, 0)
+            };
+            var closeButton = CreateButton("关闭", false);
+            closeButton.Click += (sender, e) => Close();
+            footer.Controls.Add(closeButton);
+
+            root.Controls.Add(introLabel, 0, 0);
+            root.Controls.Add(versionList, 0, 1);
+            root.Controls.Add(footer, 0, 2);
+            Controls.Add(root);
+
+            BuildVersionList();
+        }
+
+        private void BuildVersionList()
+        {
+            versionList.SuspendLayout();
+            versionList.Controls.Clear();
+            List<AiCommandVersionInfo> versions = AiCommandPatchService.ListVersions(localConfigPath);
+            if (versions.Count == 0)
+            {
+                var emptyLabel = new Label
+                {
+                    Dock = DockStyle.Top,
+                    Height = 80,
+                    Text = "还没有历史版本。`n应用一次 AI 修改后，会自动保留最近 5 个版本，可在此来回切换。",
+                    ForeColor = Color.FromArgb(91, 102, 94),
+                    Font = new Font("Microsoft YaHei UI", 9.5F),
+                    TextAlign = ContentAlignment.MiddleCenter
+                };
+                versionList.Controls.Add(emptyLabel);
+            }
+            foreach (AiCommandVersionInfo version in versions)
+            {
+                versionList.Controls.Add(CreateVersionCard(version));
+            }
+            versionList.ResumeLayout();
+            versionList.PerformLayout();
+        }
+
+        private Control CreateVersionCard(AiCommandVersionInfo version)
+        {
+            var card = new TableLayoutPanel
+            {
+                Height = 76,
+                ColumnCount = 2,
+                RowCount = 1,
+                Margin = new Padding(0, 0, 0, 8),
+                Padding = new Padding(12, 8, 12, 8),
+                BackColor = Color.FromArgb(255, 255, 252)
+            };
+            card.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            card.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 96F));
+
+            var textPanel = new Panel { Dock = DockStyle.Fill, BackColor = Color.FromArgb(255, 255, 252) };
+            string timeText = version.SavedAtUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
+            var summaryLabel = new Label
+            {
+                Dock = DockStyle.Fill,
+                Text = string.IsNullOrWhiteSpace(version.Summary) ? "AI 修改前的配置" : version.Summary,
+                ForeColor = Color.FromArgb(91, 102, 94),
+                Font = new Font("Microsoft YaHei UI", 8.5F)
+            };
+            var timeLabel = new Label
+            {
+                Dock = DockStyle.Top,
+                Text = timeText + "  ·  " + version.CommandCount + " 条命令",
+                Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+                ForeColor = ForeColor,
+                Height = 22
+            };
+            textPanel.Controls.Add(summaryLabel);
+            textPanel.Controls.Add(timeLabel);
+
+            var restoreButton = CreateButton("恢复", true);
+            restoreButton.Margin = new Padding(8, 6, 0, 6);
+            restoreButton.Click += (sender, e) => RestoreSelected(version);
+
+            card.Controls.Add(textPanel, 0, 0);
+            card.Controls.Add(restoreButton, 1, 0);
+            return card;
+        }
+
+        private void RestoreSelected(AiCommandVersionInfo version)
+        {
+            try
+            {
+                AiCommandPatchService.RestoreVersion(sharedConfigPath, localConfigPath, version.FilePath);
+                MessageBox.Show(this, "已恢复到所选版本，当前配置也已存为新的历史版本。", "AI 修改 · 版本历史",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                DialogResult = DialogResult.OK;
+                Close();
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show(this, exception.Message, "无法恢复", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private static Button CreateButton(string text, bool primary)
+        {
+            var button = new Button
+            {
+                Text = text,
+                AutoSize = true,
+                Height = 34,
+                Padding = new Padding(12, 0, 12, 0),
+                Margin = new Padding(8, 0, 0, 0),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = primary ? Color.FromArgb(151, 179, 155) : Color.FromArgb(255, 255, 252),
+                ForeColor = Color.FromArgb(23, 28, 24),
+                Cursor = Cursors.Hand,
+                Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold)
+            };
+            button.FlatAppearance.BorderColor = Color.FromArgb(23, 28, 24);
+            button.FlatAppearance.BorderSize = 2;
+            return button;
+        }
+    }
+
     internal sealed class MainForm : Form
     {
         private readonly string appDirectory;
@@ -2734,12 +3054,6 @@ namespace CliListApp
         // 置顶命令列表（pins.json，最新的在最前）
         private readonly List<string> pinnedKeys;
 
-        // 拖动排序相关字段
-        private Control dragSourceHandle;
-        private Point dragStartPoint;
-        private bool isDragging;
-        private int dragInsertIndex = -1;
-        private Panel dragIndicator;
 
 
         internal string ContextPath { get { return contextPath; } }
@@ -2749,9 +3063,7 @@ namespace CliListApp
             this.appDirectory = appDirectory;
             this.configPath = configPath;
             this.contextPath = contextPath;
-            // 应用保存的自定义排序
-            var orderedCommands = LoadCustomOrder(commands.Where(IsVisibleCommand).ToList());
-            this.commands = orderedCommands;
+            this.commands = commands.Where(IsVisibleCommand).ToList();
             this.pinnedKeys = LoadPinnedKeys();
             this.usageTracker = usageTracker;
 
@@ -2980,14 +3292,10 @@ namespace CliListApp
                 FlowDirection = FlowDirection.TopDown,
                 WrapContents = false,
                 AutoScroll = false,
-                Padding = new Padding(0, 14, 0, 8),
-                AllowDrop = true
+                Padding = new Padding(0, 14, 0, 8)
             };
 
             commandList.SizeChanged += (sender, eventArgs) => OnCommandListSizeChanged();
-            commandList.DragOver += CommandList_DragOver;
-            commandList.DragDrop += CommandList_DragDrop;
-            commandList.DragLeave += (sender, eventArgs) => HideDragIndicator();
             commandList.MouseWheel += CommandList_MouseWheel;
 
             commandScrollBar = CreateCommandScrollBar();
@@ -3001,20 +3309,6 @@ namespace CliListApp
             };
             commandListHost.Controls.Add(commandList);
 
-            // Drag indicator overlays the host panel and never enters the FlowLayoutPanel flow,
-            // otherwise every DragOver would remove/re-add it and reflow the whole list (lag).
-            dragIndicator = new Panel
-            {
-                Height = 3,
-                Width = 360,
-                BackColor = accent,
-                Visible = false,
-                Margin = Padding.Empty
-            };
-            commandListHost.Controls.Add(dragIndicator);
-
-            EnableDoubleBuffering(commandList);
-            EnableDoubleBuffering(commandListHost);
             commandListHost.SizeChanged += (sender, eventArgs) => ResizeCommandCards();
             commandListHost.MouseWheel += CommandList_MouseWheel;
 
@@ -3032,6 +3326,13 @@ namespace CliListApp
             host.Controls.Add(commandListHost, 0, 0);
             host.Controls.Add(commandScrollBar, 1, 0);
             return host;
+        }
+
+        private static void EnableDoubleBuffering(Control control)
+        {
+            var prop = typeof(Control).GetProperty("DoubleBuffered",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+            if (prop != null) { prop.SetValue(control, true, null); }
         }
 
         private void RefreshCommandList()
@@ -3078,9 +3379,6 @@ namespace CliListApp
             commandList.SuspendLayout();
             commandList.Controls.Clear();
 
-
-            bool allowDrag = sortBox.SelectedIndex == 0 && string.IsNullOrEmpty(query) && selectedTag == null;
-
             foreach (CommandItem command in visibleCommands)
             {
                 CommandUsage usage = usageTracker.Get(command);
@@ -3092,8 +3390,8 @@ namespace CliListApp
                     usageText += "  ·  LAST " + lastUsed.ToLocalTime().ToString("MM-dd HH:mm");
                 }
 
-                // 放置顺序必须是「先内容、后手柄」：两者都是 Dock 填充，WinForms 按逆 z 序
-                // 排布填充控件，先加入者先占满整行，手柄会被挤到卡片之外（表现为手柄消失）。
+                // 放置顺序必须是「先内容、后置顶按钮」：两者都是 Dock 填充，WinForms 按逆 z 序
+                // 排布填充控件，先加入者先占满整行，置顶按钮会被挤到卡片之外（表现为按钮消失）。
                 var button = new Button
                 {
                     Tag = command,
@@ -3108,26 +3406,13 @@ namespace CliListApp
                     BackColor = surface,
                     FlatStyle = FlatStyle.Flat,
                     Font = new Font("Consolas", 10F, FontStyle.Bold),
-                    Cursor = allowDrag ? Cursors.SizeAll : Cursors.Hand,
+                    Cursor = Cursors.Hand,
                     UseVisualStyleBackColor = false
                 };
                 button.FlatAppearance.BorderSize = 0;
                 button.FlatAppearance.MouseOverBackColor = surfaceHover;
                 button.FlatAppearance.MouseDownBackColor = accent;
                 button.Click += LaunchCommand;
-
-                // 左侧拖动手柄
-                var dragHandle = new Label
-                {
-                    Text = "⋮⋮",
-                    Dock = DockStyle.Left,
-                    Width = 26,
-                    Font = new Font("Consolas", 12F, FontStyle.Bold),
-                    ForeColor = textSecondary,
-                    TextAlign = ContentAlignment.MiddleCenter,
-                    BackColor = Color.FromArgb(240, 240, 235),
-                    Cursor = allowDrag ? Cursors.SizeAll : Cursors.Default
-                };
 
                 // 一键置顶按钮（Dock.Right，加入顺序最后、最先参与停靠，位于卡片右侧）
                 bool isPinned = IsPinned(command);
@@ -3154,7 +3439,7 @@ namespace CliListApp
                 pinButton.Click += (sender, e) => TogglePin(pinTarget);
                 pinButton.MouseWheel += ForwardMouseWheel;
 
-                // 创建命令卡片容器（带拖动手柄和置顶按钮）
+                // 创建命令卡片容器（带置顶按钮）
                 var cardPanel = new Panel
                 {
                     Height = 88,
@@ -3165,35 +3450,12 @@ namespace CliListApp
                     Padding = new Padding(0)
                 };
 
-                // 手柄悬停效果
-                dragHandle.MouseEnter += (sender, e) => dragHandle.BackColor = surfaceHover;
-                dragHandle.MouseLeave += (sender, e) => dragHandle.BackColor = Color.FromArgb(240, 240, 235);
-
-                // 启用拖动排序（只在手柄上）
-                if (allowDrag)
-                {
-                    dragHandle.MouseDown += CommandButton_MouseDown;
-                    dragHandle.MouseMove += CommandButton_MouseMove;
-                    dragHandle.GiveFeedback += CommandButton_GiveFeedback;
-                    dragHandle.AllowDrop = true;
-                    dragHandle.DragOver += (s, e) => CommandList_DragOver(s, e);
-                    dragHandle.DragDrop += (s, e) => CommandList_DragDrop(s, e);
-
-                    // 整张卡片都可按住拖动（手柄只是视觉提示），5px 死区保证单击仍触发启动。
-                    button.MouseDown += CommandButton_MouseDown;
-                    button.MouseMove += CommandButton_MouseMove;
-                    cardPanel.MouseDown += CommandButton_MouseDown;
-                    cardPanel.MouseMove += CommandButton_MouseMove;
-                }
-
                 cardPanel.Controls.Add(button);
-                cardPanel.Controls.Add(dragHandle);
                 cardPanel.Controls.Add(pinButton);
 
                 // 滚轮落在卡片上时转发给列表滚动条，否则鼠标停在卡片区域滚不动。
                 cardPanel.MouseWheel += ForwardMouseWheel;
                 button.MouseWheel += ForwardMouseWheel;
-                dragHandle.MouseWheel += ForwardMouseWheel;
 
                 commandList.Controls.Add(cardPanel);
             }
@@ -3229,306 +3491,6 @@ namespace CliListApp
             ResizeCommandCards();
         }
 
-        // ============== 拖动排序实现 ==============
-
-        private void CommandButton_MouseDown(object sender, MouseEventArgs e)
-        {
-            if (e.Button == MouseButtons.Left)
-            {
-                dragSourceHandle = sender as Control;
-                dragStartPoint = e.Location;
-                isDragging = false;
-            }
-        }
-
-        private void CommandButton_MouseMove(object sender, MouseEventArgs e)
-        {
-            if (dragSourceHandle == null || e.Button != MouseButtons.Left)
-            {
-                return;
-            }
-
-            // 移动足够距离才开始拖动，避免误触
-            if (!isDragging)
-            {
-                if (Math.Abs(e.X - dragStartPoint.X) < 5 && Math.Abs(e.Y - dragStartPoint.Y) < 5)
-                {
-                    return;
-                }
-                isDragging = true;
-                // 拖动期间卡片会被改成无边框并加上内边距，控件尺寸随之变化（会从 88 掉到 3），
-                // 所以命中判断所需的高度与布局坐标必须在改样式之前先缓存下来。
-                CacheCommandCardLayout();
-                // 高亮整个卡片
-                var cardPanel = dragSourceHandle.Parent as Panel;
-                if (cardPanel != null)
-                {
-                    cardPanel.BackColor = Color.FromArgb(200, 215, 198);
-                    cardPanel.BorderStyle = BorderStyle.None;
-                    cardPanel.Padding = new Padding(2);
-                    cardPanel.Height = 88;   // 维持卡片高度，避免拖拽时列表整体跳动
-                }
-            }
-
-            // 执行拖放操作
-            DragDropEffects effect = dragSourceHandle.DoDragDrop(dragSourceHandle, DragDropEffects.Move);
-
-            // 拖动结束后恢复样式
-            if (effect == DragDropEffects.Move)
-            {
-                var cardPanel = dragSourceHandle.Parent as Panel;
-                if (cardPanel != null)
-                {
-                    cardPanel.BackColor = surface;
-                    cardPanel.BorderStyle = BorderStyle.FixedSingle;
-                    cardPanel.Padding = new Padding(0);
-                    cardPanel.Height = 88;
-                }
-            }
-
-            dragSourceHandle = null;
-            isDragging = false;
-            HideDragIndicator();
-        }
-
-        private static void EnableDoubleBuffering(Control control)
-        {
-            var prop = typeof(Control).GetProperty("DoubleBuffered",
-                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-            if (prop != null) { prop.SetValue(control, true, null); }
-        }
-
-        private void CommandList_DragOver(object sender, DragEventArgs e)
-        {
-            e.Effect = DragDropEffects.Move;
-
-            // 计算插入位置
-            Point pt = commandList.PointToClient(new Point(e.X, e.Y));
-            dragInsertIndex = GetInsertIndex(pt.Y);
-            ShowDragIndicator(dragInsertIndex);        }
-
-        private void CommandList_DragDrop(object sender, DragEventArgs e)
-        {
-            if (!e.Data.GetDataPresent(typeof(Control)))
-            {
-                return;
-            }
-
-            Control sourceHandle = (Control)e.Data.GetData(typeof(Control));
-            Panel sourceCard = sourceHandle.Parent as Panel;
-            Point pt = commandList.PointToClient(new Point(e.X, e.Y));
-            int targetIndex = GetInsertIndex(pt.Y);
-
-            // 获取源命令在当前列表中的索引
-            int sourceIndex = -1;
-            int cardIndex = 0;
-            foreach (Control ctrl in commandList.Controls)
-            {
-                if (ctrl is Panel && ((Panel)ctrl).Controls.Count >= 2)
-                {
-                    // 先加入的是内容按钮，Tag 是 CommandItem
-                    var btn = ((Panel)ctrl).Controls[0] as Button;
-                    if (btn != null && btn.Tag is CommandItem)
-                    {
-                        if (ctrl == sourceCard)
-                        {
-                            sourceIndex = cardIndex;
-                            break;
-                        }
-                        cardIndex++;
-                    }
-                }
-            }
-
-            if (sourceIndex < 0 || sourceIndex == targetIndex)
-            {
-                HideDragIndicator();
-                return;
-            }
-
-            // 调整目标索引（如果源在目标之前，需要减1）
-            if (sourceIndex < targetIndex)
-            {
-                targetIndex--;
-            }
-
-            // 执行移动
-            MoveCommand(sourceIndex, targetIndex);
-            HideDragIndicator();
-        }
-
-        private void CommandButton_GiveFeedback(object sender, GiveFeedbackEventArgs e)
-        {
-            e.UseDefaultCursors = true;
-        }
-
-        // 拖动前统一记录各卡片的布局 Top：列表本身会被滚动条整体上移（负数 Top），
-        // 命中判断必须用卡片的列表内坐标，不能直接用控件的 Top。
-        private readonly List<int> commandCardTops = new List<int>();
-        private readonly List<int> commandCardHeights = new List<int>();
-
-        private void CacheCommandCardLayout()
-        {
-            commandCardTops.Clear();
-            commandCardHeights.Clear();
-
-            if (commandList == null)
-            {
-                return;
-            }
-
-            int y = commandList.Padding.Top;
-            foreach (Control ctrl in commandList.Controls)
-            {
-                if (ctrl == dragIndicator) continue;
-                if (!(ctrl is Panel) || ((Panel)ctrl).BorderStyle != BorderStyle.FixedSingle) continue;
-                if (((Panel)ctrl).Controls.Count < 2) continue;
-
-                commandCardTops.Add(y);
-                commandCardHeights.Add(ctrl.Height);
-                y += ctrl.Height + ctrl.Margin.Bottom;
-            }
-        }
-
-        private int GetInsertIndex(double y)
-        {
-            for (int index = 0; index < commandCardTops.Count; index++)
-            {
-                if (y < commandCardTops[index] + commandCardHeights[index] / 2.0)
-                {
-                    return index;
-                }
-            }
-
-            return commandCardTops.Count;
-        }
-
-        private void ShowDragIndicator(int index)
-        {
-            if (dragIndicator == null) return;
-
-            // Insert Y in list-local coords; out of range falls back to below the last card.
-            int y = commandList.Padding.Top;
-            if (commandCardTops.Count > 0)
-            {
-                if (index < commandCardTops.Count)
-                {
-                    y = commandCardTops[index];
-                }
-                else
-                {
-                    y = commandCardTops[commandCardTops.Count - 1] + commandCardHeights[commandCardHeights.Count - 1];
-                }
-            }
-            // commandList scrolls via a negative Top, so host Y = list-local y + commandList.Top.
-            int hostY = y - 2 + commandList.Top;
-            int indicatorWidth = CommandCardWidth();
-            if (dragIndicator.Visible && dragIndicator.Top == hostY && dragIndicator.Width == indicatorWidth)
-            {
-                return;
-            }
-            dragIndicator.Location = new Point(0, hostY);
-            dragIndicator.Width = indicatorWidth;
-            dragIndicator.Visible = true;
-            dragIndicator.BringToFront();
-        }
-
-        private void HideDragIndicator()
-        {
-            dragInsertIndex = -1;
-            if (dragIndicator != null && dragIndicator.Parent != null)
-            {
-                dragIndicator.Visible = false;
-            }
-            commandCardTops.Clear();
-            commandCardHeights.Clear();
-        }
-
-        private void MoveCommand(int sourceIndex, int targetIndex)
-        {
-            if (sourceIndex == targetIndex) return;
-
-            // 从 commands 列表中移动项
-            var cmdList = commands.ToList();
-            CommandItem item = cmdList[sourceIndex];
-            cmdList.RemoveAt(sourceIndex);
-            cmdList.Insert(targetIndex, item);
-
-            // 更新 commands 列表
-            for (int i = 0; i < cmdList.Count; i++)
-            {
-                if (i < commands.Count)
-                {
-                    commands[i] = cmdList[i];
-                }
-            }
-
-            SaveCustomOrder(cmdList);
-            RefreshCommandList();
-        }
-
-        private void SaveCustomOrder(List<CommandItem> orderedCommands)
-        {
-            try
-            {
-                // 单独保存排序到 order.json，不修改命令配置
-                string orderPath = Path.Combine(Path.GetDirectoryName(configPath), "order.json");
-
-                // 只保存命令 Id 的顺序列表
-                List<string> orderIds = orderedCommands
-                    .Select(cmd => UsageTracker.GetKey(cmd))
-                    .ToList();
-
-                string json = new JavaScriptSerializer().Serialize(orderIds);
-                File.WriteAllText(orderPath, json, new UTF8Encoding(false));
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("保存排序失败：" + ex.Message, "CLI List", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-        }
-
-        private List<CommandItem> LoadCustomOrder(List<CommandItem> defaultCommands)
-        {
-            try
-            {
-                string orderPath = Path.Combine(Path.GetDirectoryName(configPath), "order.json");
-                if (!File.Exists(orderPath))
-                {
-                    return defaultCommands;
-                }
-
-                string json = File.ReadAllText(orderPath);
-                List<string> orderIds = new JavaScriptSerializer().Deserialize<List<string>>(json);
-                if (orderIds == null || orderIds.Count == 0)
-                {
-                    return defaultCommands;
-                }
-
-                var ordered = new List<CommandItem>();
-                var remaining = new List<CommandItem>(defaultCommands);
-
-                // 按 order.json 的顺序排列
-                foreach (string key in orderIds)
-                {
-                    int index = remaining.FindIndex(c =>
-                        string.Equals(UsageTracker.GetKey(c), key, StringComparison.OrdinalIgnoreCase));
-                    if (index >= 0)
-                    {
-                        ordered.Add(remaining[index]);
-                        remaining.RemoveAt(index);
-                    }
-                }
-
-                // 追加新增的命令
-                ordered.AddRange(remaining);
-                return ordered;
-            }
-            catch
-            {
-                return defaultCommands;
-            }
-        }
 
         // ============== 一键置顶实现 ==============
 
@@ -3596,8 +3558,6 @@ namespace CliListApp
             SavePins();
             RefreshCommandList();
         }
-
-        // ============== 拖动排序结束 ==============
 
         // FlowLayoutPanel 每次改高度都会触发 SizeChanged，若直接在里面重新量高度会互相递归，
         // 因此只在「宽度变化」时重排卡片与滚动条。
@@ -3673,10 +3633,6 @@ namespace CliListApp
             int contentHeight = commandList.Padding.Top + commandList.Padding.Bottom;
             foreach (Control control in commandList.Controls)
             {
-                if (control == dragIndicator)
-                {
-                    continue; // 指示线绝对定位，不占流式布局高度。
-                }
                 contentHeight += control.Height + control.Margin.Bottom + control.Margin.Top;
             }
 
@@ -4030,9 +3986,9 @@ namespace CliListApp
 
         private void ReloadCommands()
         {
-            commands = LoadCustomOrder(Program.LoadCommands(Path.Combine(appDirectory, "commands.json"))
+            commands = Program.LoadCommands(Path.Combine(appDirectory, "commands.json"))
                 .Where(IsVisibleCommand)
-                .ToList());
+                .ToList();
 
             tagFilter.BeginUpdate();
             try
