@@ -3983,12 +3983,146 @@ namespace CliListApp
                 updateButton.Click += (sender, eventArgs) => UpdateManager.CheckForUpdate(this, appDirectory);
                 footer.Controls.Add(updateButton);
             }
+            else
+            {
+                // 开发版提供“立即重启”：同目录有构建脚本时先重建再重启，便于改代码后快速生效。
+                var restartButton = CreateFooterButton("立即重启");
+                restartButton.Click += (sender, eventArgs) => RestartForDevelopment();
+                footer.Controls.Add(restartButton);
+            }
 
             footer.Controls.Add(closeButton);
             footer.Controls.Add(aiEditButton);
             return footer;
         }
 
+        // 开发版“立即重启”：同目录存在 build.ps1 与 CLIList.cs 时，先重建到临时文件，
+        // 再通过独立脚本等待本进程退出、覆盖自身并启动新进程；构建失败则保持当前进程运行。
+        private void RestartForDevelopment()
+        {
+            string buildScript = Path.Combine(appDirectory, "build.ps1");
+            string targetExecutable = Path.Combine(appDirectory, "CLIList.exe");
+            string tempPrefix = Path.Combine(Path.GetTempPath(), "cli-list-restart-" + Guid.NewGuid().ToString("N"));
+            string newExecutablePath = null;
+            string argumentsPath = null;
+
+            try
+            {
+                string[] rawArguments = Environment.GetCommandLineArgs();
+                var argumentList = new List<string>();
+                for (int i = 1; i < rawArguments.Length; i++)
+                {
+                    string argument = rawArguments[i];
+                    argumentList.Add(
+                        argument.IndexOf(' ') >= 0 || argument.IndexOf('"') >= 0
+                            ? "\"" + argument.Replace("\"", "\\\"") + "\""
+                            : argument);
+                }
+                string argumentLine = string.Join(" ", argumentList);
+
+                if (File.Exists(buildScript) && File.Exists(Path.Combine(appDirectory, "CLIList.cs")))
+                {
+                    newExecutablePath = tempPrefix + ".exe";
+                    Cursor previousCursor = Cursor.Current;
+                    Cursor.Current = Cursors.WaitCursor;
+                    try
+                    {
+                        var buildStartInfo = new ProcessStartInfo
+                        {
+                            FileName = "powershell.exe",
+                            Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + buildScript +
+                                        "\" -SkipInstalledSync -OutputPath \"" + newExecutablePath + "\"",
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        };
+                        int buildExitCode;
+                        using (Process buildProcess = Process.Start(buildStartInfo))
+                        {
+                            buildProcess.WaitForExit();
+                            buildExitCode = buildProcess.ExitCode;
+                        }
+                        if (buildExitCode != 0 || !File.Exists(newExecutablePath))
+                        {
+                            MessageBox.Show(this,
+                                "重新构建失败，已保持当前版本运行。\n\n请先修复编译错误后重试。",
+                                "CLI List",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Error);
+                            return;
+                        }
+                    }
+                    finally
+                    {
+                        Cursor.Current = previousCursor;
+                    }
+                }
+
+                argumentsPath = tempPrefix + ".args";
+                if (!string.IsNullOrEmpty(argumentLine))
+                {
+                    File.WriteAllText(argumentsPath, argumentLine, new UTF8Encoding(false));
+                }
+                string[] scriptLines =
+                {
+                    "param(",
+                    "    [int]$WaitPid,",
+                    "    [string]$NewExe,",
+                    "    [string]$TargetExe,",
+                    "    [string]$ArgsFile",
+                    ")",
+                    "$ErrorActionPreference = 'Stop'",
+                    "try {",
+                    "    if ($WaitPid -gt 0) {",
+                    "        Wait-Process -Id $WaitPid -Timeout 15 -ErrorAction SilentlyContinue",
+                    "        Start-Sleep -Milliseconds 300",
+                    "    }",
+                    "    try {",
+                    "        if ($NewExe -and (Test-Path -LiteralPath $NewExe)) {",
+                    "            Copy-Item -LiteralPath $NewExe -Destination $TargetExe -Force",
+                    "        }",
+                    "        $launchArgs = @()",
+                    "        if ($ArgsFile -and (Test-Path -LiteralPath $ArgsFile)) {",
+                    "            [string]$line = (Get-Content -LiteralPath $ArgsFile -Raw -Encoding UTF8)",
+                    "            if (-not [string]::IsNullOrWhiteSpace($line)) { $launchArgs = @($line.Trim()) }",
+                    "        }",
+                    "        Start-Process -FilePath $TargetExe -ArgumentList $launchArgs",
+                    "    }",
+                    "    catch {",
+                    "        # 重启失败保持静默，避免打扰仍在运行的开发窗口。",
+                    "    }",
+                    "}",
+                    "finally {",
+                    "    if ($NewExe -and (Test-Path -LiteralPath $NewExe)) { Remove-Item -LiteralPath $NewExe -Force -ErrorAction SilentlyContinue }",
+                    "    if ($ArgsFile -and (Test-Path -LiteralPath $ArgsFile)) { Remove-Item -LiteralPath $ArgsFile -Force -ErrorAction SilentlyContinue }",
+                    "}"
+                };
+                string restartScript = string.Join("\r\n", scriptLines);
+                string restartScriptPath = tempPrefix + ".ps1";
+                File.WriteAllText(restartScriptPath, restartScript, new UTF8Encoding(true));
+
+                var restartStartInfo = new ProcessStartInfo
+                {
+                    FileName = "powershell.exe",
+                    Arguments = "-NoProfile -ExecutionPolicy Bypass -File \"" + restartScriptPath + "\"" +
+                                " -WaitPid " + Process.GetCurrentProcess().Id +
+                                " -NewExe \"" + newExecutablePath + "\"" +
+                                " -TargetExe \"" + targetExecutable + "\"" +
+                                " -ArgsFile \"" + argumentsPath + "\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                Process.Start(restartStartInfo);
+                Application.Exit();
+            }
+            catch (Exception exception)
+            {
+                MessageBox.Show(this,
+                    "立即重启失败：\n\n" + exception.Message,
+                    "CLI List",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
         internal void ShowAvailableUpdate(string tagName)
         {
             if (updateButton == null)

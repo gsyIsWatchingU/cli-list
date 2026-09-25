@@ -31,6 +31,12 @@ if ($sourceText -notmatch 'if \(AppInfo\.IsInstalledRelease\)\s*\{\s*updateItem 
 if ($sourceText -notmatch 'if \(AppInfo\.IsInstalledRelease\)\s*\{\s*updateButton = CreateFooterButton\("检查更新"\)') {
     throw 'CLI List 主窗口“检查更新”入口必须由 IsInstalledRelease 守卫。'
 }
+if ($sourceText -notmatch 'restartButton = CreateFooterButton\("立即重启"\)') {
+    throw 'CLI List 开发版应提供“立即重启”入口。'
+}
+if ($sourceText -notmatch 'private void RestartForDevelopment') {
+    throw 'CLI List 缺少开发版“立即重启”实现。'
+}
 
 if (-not $SkipBuild) {
     & (Join-Path $PSScriptRoot 'build.ps1') -SkipInstalledSync:$SkipInstalledSync -Release:$Release
