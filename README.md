@@ -4,6 +4,8 @@ CLI List 是一个面向 Windows 开发者的独立桌面应用。用户下载�
 
 > 产品定位：CLI List 的主体是可双击打开的 Windows 应用；资源管理器右键菜单、全局快捷键和系统托盘只是安装后的辅助入口，不是产品本体。
 
+> **下载安装：** 前往 [GitHub Releases 最新版](https://github.com/gsyIsWatchingU/cli-list/releases/latest)，下载 `cli-list-vX.Y.Z.zip`，解压后双击 `CLIList.exe`。个人主页仅用于产品展示，不提供安装包下载。
+
 ![CLI List 极简像素界面](assets/screenshot.png)
 
 ## 核心能力
