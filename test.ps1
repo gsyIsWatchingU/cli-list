@@ -64,6 +64,17 @@ try {
         throw '未生成正式安装包构建产物。'
     }
 
+    # “本地开发版”环境判断需要一份非正式版构建。仅当 -Release 时主目录 CLIList.exe
+    # 已是正式版，才额外构建独立开发版；否则直接复用主目录构建产物。
+    $devCheckExecutablePath = $executablePath
+    if ($Release) {
+        $devCheckExecutablePath = Join-Path $temporaryDirectory 'CLIList-Dev.exe'
+        & (Join-Path $PSScriptRoot 'build.ps1') -SkipInstalledSync -OutputPath $devCheckExecutablePath
+        if (-not (Test-Path -LiteralPath $devCheckExecutablePath)) {
+            throw '未生成本地开发版构建产物。'
+        }
+    }
+
     $envCheckScriptPath = Join-Path $temporaryDirectory 'check-env.ps1'
     @'
 param(
@@ -94,7 +105,7 @@ if ($method.Invoke($null, [object[]]@($other))) {
 }
 '@ | Set-Content -LiteralPath $envCheckScriptPath -Encoding Unicode
 
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $envCheckScriptPath -ExecutablePath (Join-Path $temporaryDirectory 'CLIList.exe')
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $envCheckScriptPath -ExecutablePath $devCheckExecutablePath
     if ($LASTEXITCODE -ne 0) {
         throw "本地开发版环境判断测试失败，退出码：$LASTEXITCODE"
     }
