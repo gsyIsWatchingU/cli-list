@@ -1,11 +1,18 @@
 ﻿param(
-    [switch]$SkipInstalledSync
+    [switch]$SkipInstalledSync,
+    [switch]$Release,
+    [string]$OutputPath
 )
 
 $ErrorActionPreference = 'Stop'
 
 $sourcePath = Join-Path $PSScriptRoot 'CLIList.cs'
-$outputPath = Join-Path $PSScriptRoot 'CLIList.exe'
+$targetPath = if ($OutputPath) {
+    [IO.Path]::GetFullPath($OutputPath)
+}
+else {
+    Join-Path $PSScriptRoot 'CLIList.exe'
+}
 $iconPath = Join-Path $PSScriptRoot 'cli-list.ico'
 $compilerCandidates = @(
     (Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'),
@@ -34,32 +41,44 @@ else {
     Write-Output '图标资源未变化，复用现有 cli-list.ico。'
 }
 
-if (Test-Path -LiteralPath $outputPath) {
-    Remove-Item -LiteralPath $outputPath -Force
+if (Test-Path -LiteralPath $targetPath) {
+    Remove-Item -LiteralPath $targetPath -Force
 }
 
 if (-not $compilerPath) {
     throw '未找到 .NET Framework 4.x C# 编译器。'
 }
 
-& $compilerPath `
-    /nologo `
-    /target:winexe `
-    /optimize+ `
-    /codepage:65001 `
-    "/win32icon:$iconPath" `
-    "/reference:System.Windows.Forms.dll" `
-    "/reference:System.Drawing.dll" `
-    "/reference:System.IO.Compression.dll" `
-    "/reference:System.Web.Extensions.dll" `
-    "/out:$outputPath" `
-    $sourcePath
+$compilerArgs = @(
+    '/nologo',
+    '/target:winexe',
+    '/optimize+',
+    '/codepage:65001',
+    "/win32icon:$iconPath",
+    '/reference:System.Windows.Forms.dll',
+    '/reference:System.Drawing.dll',
+    '/reference:System.IO.Compression.dll',
+    '/reference:System.Web.Extensions.dll',
+    "/out:$targetPath"
+)
+if ($Release) {
+    # 正式安装包构建标记：区分“用户安装版”与本地开发版。
+    $compilerArgs += '/define:CLI_LIST_RELEASE'
+}
+$compilerArgs += $sourcePath
+
+& $compilerPath @compilerArgs
 
 if ($LASTEXITCODE -ne 0) {
     throw "C# 编译失败，退出码：$LASTEXITCODE"
 }
 
-Write-Output "已生成：$outputPath"
+Write-Output "已生成：$targetPath"
+
+if ($OutputPath) {
+    Write-Output '已跳过安装版同步（指定了独立输出路径）。'
+    return
+}
 
 $installDirectory = Join-Path $env:USERPROFILE '.cli-list'
 $installedExecutablePath = Join-Path $installDirectory 'CLIList.exe'
@@ -75,7 +94,7 @@ if (-not $SkipInstalledSync -and (Test-Path -LiteralPath $installDirectory)) {
 
     for ($attempt = 1; $attempt -le 10; $attempt++) {
         try {
-            Copy-Item -LiteralPath $outputPath -Destination $installedExecutablePath -Force
+            Copy-Item -LiteralPath $targetPath -Destination $installedExecutablePath -Force
             break
         }
         catch {

@@ -1,6 +1,7 @@
 ﻿param(
     [switch]$SkipBuild,
-    [switch]$SkipInstalledSync
+    [switch]$SkipInstalledSync,
+    [switch]$Release
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,16 +16,24 @@ foreach ($scriptPath in Get-ChildItem -LiteralPath $PSScriptRoot -Filter '*.ps1'
 }
 
 $sourceText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'CLIList.cs') -Raw -Encoding UTF8
-if ($sourceText -notmatch 'BeginSilentCheck\(tagName\s*=>') {
-    throw 'CLI List 启动流程缺少静默更新检查。'
+if ($sourceText -notmatch 'public static bool IsInstalledRelease') {
+    throw 'CLI List 缺少统一的用户安装版环境判断 IsInstalledRelease。'
 }
-if ($sourceText -notmatch 'new ToolStripMenuItem\("检查更新…"\)' -or
-    $sourceText -notmatch 'CreateFooterButton\("检查更新"\)') {
-    throw 'CLI List 的托盘或主窗口缺少常驻“检查更新”入口。'
+if ($sourceText -notmatch 'if \(!AppInfo\.IsInstalledRelease\)\s*\{\s*// 本地开发版不启动静默更新检查') {
+    throw 'CLI List 的静默更新检查必须经过 IsInstalledRelease 守卫。'
+}
+if ($sourceText -notmatch '本地开发版不提供更新功能') {
+    throw 'CLI List 的 CheckForUpdate 必须拒绝本地开发版的更新请求。'
+}
+if ($sourceText -notmatch 'if \(AppInfo\.IsInstalledRelease\)\s*\{\s*updateItem = new ToolStripMenuItem\("检查更新…"\)') {
+    throw 'CLI List 托盘“检查更新”入口必须由 IsInstalledRelease 守卫。'
+}
+if ($sourceText -notmatch 'if \(AppInfo\.IsInstalledRelease\)\s*\{\s*updateButton = CreateFooterButton\("检查更新"\)') {
+    throw 'CLI List 主窗口“检查更新”入口必须由 IsInstalledRelease 守卫。'
 }
 
 if (-not $SkipBuild) {
-    & (Join-Path $PSScriptRoot 'build.ps1') -SkipInstalledSync:$SkipInstalledSync
+    & (Join-Path $PSScriptRoot 'build.ps1') -SkipInstalledSync:$SkipInstalledSync -Release:$Release
 }
 
 $executablePath = Join-Path $PSScriptRoot 'CLIList.exe'
@@ -46,6 +55,53 @@ try {
     $localConfigProcess = Start-Process -FilePath (Join-Path $temporaryDirectory 'CLIList.exe') -ArgumentList '--validate' -Wait -PassThru
     if ($localConfigProcess.ExitCode -ne 0) {
         throw "本机命令覆盖配置验证失败，退出码：$($localConfigProcess.ExitCode)"
+    }
+
+    # ---- 开发版/安装版环境判断与更新入口自动化测试 ----
+    $releaseExePath = Join-Path $temporaryDirectory 'CLIList-Release.exe'
+    & (Join-Path $PSScriptRoot 'build.ps1') -SkipInstalledSync -Release -OutputPath $releaseExePath
+    if (-not (Test-Path -LiteralPath $releaseExePath)) {
+        throw '未生成正式安装包构建产物。'
+    }
+
+    $envCheckScriptPath = Join-Path $temporaryDirectory 'check-env.ps1'
+    @'
+param(
+    [string]$ExecutablePath,
+    [switch]$ExpectRelease
+)
+$ErrorActionPreference = 'Stop'
+$assembly = [Reflection.Assembly]::Load([IO.File]::ReadAllBytes($ExecutablePath))
+$appInfo = $assembly.GetType('CliListApp.AppInfo', $true)
+$isReleaseBuild = $appInfo.GetProperty('IsReleaseBuild').GetValue($null, $null)
+$isInstalledRelease = $appInfo.GetProperty('IsInstalledRelease').GetValue($null, $null)
+if ($ExpectRelease) {
+    if (-not $isReleaseBuild) { throw '正式安装包构建应标记 IsReleaseBuild=true。' }
+}
+else {
+    if ($isReleaseBuild) { throw '本地开发版不应标记 IsReleaseBuild=true。' }
+}
+if ($isInstalledRelease) { throw '从临时目录加载不应判定为用户安装版。' }
+$installer = $assembly.GetType('CliListApp.Installer', $true)
+$method = $installer.GetMethod('IsProductInstallDirectory', [Reflection.BindingFlags]'Static,Public,NonPublic')
+$canonical = [IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.cli-list'))
+if (-not $method.Invoke($null, [object[]]@($canonical))) {
+    throw "规范安装目录应被识别为产品安装目录：$canonical"
+}
+$other = [IO.Path]::GetFullPath((Join-Path $env:USERPROFILE 'cli-list-temp-not-installed'))
+if ($method.Invoke($null, [object[]]@($other))) {
+    throw "非规范安装目录不应被识别为产品安装目录：$other"
+}
+'@ | Set-Content -LiteralPath $envCheckScriptPath -Encoding Unicode
+
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $envCheckScriptPath -ExecutablePath (Join-Path $temporaryDirectory 'CLIList.exe')
+    if ($LASTEXITCODE -ne 0) {
+        throw "本地开发版环境判断测试失败，退出码：$LASTEXITCODE"
+    }
+
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $envCheckScriptPath -ExecutablePath $releaseExePath -ExpectRelease
+    if ($LASTEXITCODE -ne 0) {
+        throw "正式安装包构建环境判断测试失败，退出码：$LASTEXITCODE"
     }
 
     if (-not $env:CI) {

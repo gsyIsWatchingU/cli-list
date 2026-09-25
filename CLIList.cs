@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -38,6 +38,33 @@ namespace CliListApp
         public static string DisplayName
         {
             get { return "CLI List v" + Version; }
+        }
+
+        // 是否为正式安装包构建的程序集（由官方发布构建流程通过 /define:CLI_LIST_RELEASE 写入）。
+        public static bool IsReleaseBuild
+        {
+            get
+            {
+#if CLI_LIST_RELEASE
+                return true;
+#else
+                return false;
+#endif
+            }
+        }
+
+        // 统一环境判断：只有正式安装包构建、且正从规范安装目录运行时，才视为“用户安装版”。
+        // 所有更新入口、启动检查、定时检查和更新请求都必须经过此判断。
+        public static bool IsInstalledRelease
+        {
+            get
+            {
+#if CLI_LIST_RELEASE
+                return Installer.IsProductInstallDirectory(AppDomain.CurrentDomain.BaseDirectory);
+#else
+                return false;
+#endif
+            }
         }
     }
 
@@ -607,6 +634,12 @@ namespace CliListApp
 
         public static void BeginSilentCheck(Action<string> onAvailable)
         {
+            if (!AppInfo.IsInstalledRelease)
+            {
+                // 本地开发版不启动静默更新检查，也不发送任何更新请求。
+                return;
+            }
+
             ThreadPool.QueueUserWorkItem(state =>
             {
                 try
@@ -646,12 +679,9 @@ namespace CliListApp
             {
                 string installDirectory = Path.GetFullPath(appDirectory)
                     .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-                string sourceMarkerPath = Path.Combine(installDirectory, ".source-repository");
-                bool isSourceInstall = File.Exists(sourceMarkerPath);
-
-                if (!isSourceInstall && !Installer.IsProductInstallDirectory(installDirectory))
+                if (!AppInfo.IsInstalledRelease)
                 {
-                    throw new InvalidOperationException("请从已安装的 CLI List 中检查更新，不能直接更新源码目录或临时解压目录。");
+                    throw new InvalidOperationException("本地开发版不提供更新功能，请通过正式安装包安装后使用。");
                 }
 
                 System.Net.ServicePointManager.SecurityProtocol = (System.Net.SecurityProtocolType)3072;
@@ -707,77 +737,54 @@ namespace CliListApp
                 string helperPath = Path.Combine(workDirectory, "update-helper.ps1");
                 File.Copy(helperSourcePath, helperPath, true);
 
-                if (isSourceInstall)
+                Dictionary<string, object> asset = FindReleaseAsset(release, tagName);
+                string downloadUrl = GetRequiredString(asset, "browser_download_url", "Release 安装包缺少下载地址。");
+                object sizeValue;
+                long expectedSize = asset.TryGetValue("size", out sizeValue)
+                    ? Convert.ToInt64(sizeValue, CultureInfo.InvariantCulture)
+                    : 0;
+                if (expectedSize < 0 || expectedSize > 100 * 1024 * 1024)
                 {
-                    string sourceDirectory = File.ReadAllText(sourceMarkerPath).Trim().TrimStart('\uFEFF');
-                    if (string.IsNullOrWhiteSpace(sourceDirectory) ||
-                        (!Directory.Exists(Path.Combine(sourceDirectory, ".git")) &&
-                         !File.Exists(Path.Combine(sourceDirectory, ".git"))))
-                    {
-                        throw new InvalidDataException("源码安装标记无效，请重新运行 install.ps1。");
-                    }
-
-                    StartUpdateHelper(
-                        helperPath,
-                        "Source",
-                        installDirectory,
-                        null,
-                        null,
-                        sourceDirectory,
-                        workDirectory
-                    );
+                    throw new InvalidDataException("Release 安装包大小异常。");
                 }
-                else
+
+                string expectedHash = GetExpectedHash(asset, downloadUrl, workDirectory);
+
+                string zipPath = Path.Combine(workDirectory, "update.zip");
+                using (var client = CreateWebClient())
                 {
-                    Dictionary<string, object> asset = FindReleaseAsset(release, tagName);
-                    string downloadUrl = GetRequiredString(asset, "browser_download_url", "Release 安装包缺少下载地址。");
-                    object sizeValue;
-                    long expectedSize = asset.TryGetValue("size", out sizeValue)
-                        ? Convert.ToInt64(sizeValue, CultureInfo.InvariantCulture)
-                        : 0;
-                    if (expectedSize < 0 || expectedSize > 100 * 1024 * 1024)
-                    {
-                        throw new InvalidDataException("Release 安装包大小异常。");
-                    }
-
-                    string expectedHash = GetExpectedHash(asset, downloadUrl, workDirectory);
-
-                    string zipPath = Path.Combine(workDirectory, "update.zip");
-                    using (var client = CreateWebClient())
-                    {
-                        client.DownloadFile(downloadUrl, zipPath);
-                    }
-
-                    long actualSize = new FileInfo(zipPath).Length;
-                    if (actualSize <= 0 || actualSize > 100 * 1024 * 1024 ||
-                        (expectedSize > 0 && actualSize != expectedSize))
-                    {
-                        throw new InvalidDataException("更新包下载不完整，当前版本未做任何修改。");
-                    }
-
-                    string actualHash = ComputeSha256(zipPath);
-                    if (!string.Equals(actualHash, expectedHash, StringComparison.OrdinalIgnoreCase))
-                    {
-                        throw new InvalidDataException("更新包校验失败，当前版本未做任何修改。");
-                    }
-
-                    string updateId = Guid.NewGuid().ToString("N");
-                    stageDirectory = installDirectory + ".__stage." + updateId;
-                    string backupDirectory = installDirectory + ".__backup";
-                    ExtractZipSafely(zipPath, stageDirectory);
-                    PreserveUserFiles(installDirectory, stageDirectory);
-                    ValidateStagedRelease(stageDirectory, latestVersion);
-
-                    StartUpdateHelper(
-                        helperPath,
-                        "Release",
-                        installDirectory,
-                        stageDirectory,
-                        backupDirectory,
-                        null,
-                        workDirectory
-                    );
+                    client.DownloadFile(downloadUrl, zipPath);
                 }
+
+                long actualSize = new FileInfo(zipPath).Length;
+                if (actualSize <= 0 || actualSize > 100 * 1024 * 1024 ||
+                    (expectedSize > 0 && actualSize != expectedSize))
+                {
+                    throw new InvalidDataException("更新包下载不完整，当前版本未做任何修改。");
+                }
+
+                string actualHash = ComputeSha256(zipPath);
+                if (!string.Equals(actualHash, expectedHash, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidDataException("更新包校验失败，当前版本未做任何修改。");
+                }
+
+                string updateId = Guid.NewGuid().ToString("N");
+                stageDirectory = installDirectory + ".__stage." + updateId;
+                string backupDirectory = installDirectory + ".__backup";
+                ExtractZipSafely(zipPath, stageDirectory);
+                PreserveUserFiles(installDirectory, stageDirectory);
+                ValidateStagedRelease(stageDirectory, latestVersion);
+
+                StartUpdateHelper(
+                    helperPath,
+                    "Release",
+                    installDirectory,
+                    stageDirectory,
+                    backupDirectory,
+                    null,
+                    workDirectory
+                );
 
                 handedOff = true;
                 Application.Exit();
@@ -1225,8 +1232,6 @@ namespace CliListApp
             openItem.Click += (sender, eventArgs) => ShowCommandPanel(null, false);
             var versionItem = new ToolStripMenuItem(AppInfo.DisplayName);
             versionItem.Enabled = false;
-            updateItem = new ToolStripMenuItem("检查更新…");
-            updateItem.Click += (sender, eventArgs) => UpdateManager.CheckForUpdate(null, appDirectory);
             var uninstallItem = new ToolStripMenuItem("卸载 CLI List…");
             uninstallItem.Click += (sender, eventArgs) => UninstallFromTray();
             var exitItem = new ToolStripMenuItem("退出");
@@ -1235,7 +1240,12 @@ namespace CliListApp
             trayMenu = new ContextMenuStrip();
             trayMenu.Items.Add(openItem);
             trayMenu.Items.Add(versionItem);
-            trayMenu.Items.Add(updateItem);
+            if (AppInfo.IsInstalledRelease)
+            {
+                updateItem = new ToolStripMenuItem("检查更新…");
+                updateItem.Click += (sender, eventArgs) => UpdateManager.CheckForUpdate(null, appDirectory);
+                trayMenu.Items.Add(updateItem);
+            }
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add(uninstallItem);
             trayMenu.Items.Add(new ToolStripSeparator());
@@ -1287,8 +1297,11 @@ namespace CliListApp
         private void ShowAvailableUpdate(string tagName)
         {
             availableUpdateTag = tagName;
-            updateItem.Text = "↑ 更新到 " + tagName;
-            updateItem.Visible = true;
+            if (updateItem != null)
+            {
+                updateItem.Text = "立即更新到 " + tagName;
+                updateItem.Visible = true;
+            }
             if (mainForm != null && !mainForm.IsDisposed)
             {
                 mainForm.ShowAvailableUpdate(tagName);
@@ -3964,18 +3977,25 @@ namespace CliListApp
                 }
             };
 
-            updateButton = CreateFooterButton("检查更新");
-            updateButton.Click += (sender, eventArgs) => UpdateManager.CheckForUpdate(this, appDirectory);
+            if (AppInfo.IsInstalledRelease)
+            {
+                updateButton = CreateFooterButton("检查更新");
+                updateButton.Click += (sender, eventArgs) => UpdateManager.CheckForUpdate(this, appDirectory);
+                footer.Controls.Add(updateButton);
+            }
 
             footer.Controls.Add(closeButton);
             footer.Controls.Add(aiEditButton);
-            footer.Controls.Add(updateButton);
             return footer;
         }
 
         internal void ShowAvailableUpdate(string tagName)
         {
-            updateButton.Text = "↑ 更新 " + tagName;
+            if (updateButton == null)
+            {
+                return;
+            }
+            updateButton.Text = "立即更新到 " + tagName;
             updateButton.Visible = true;
         }
 
@@ -5527,8 +5547,8 @@ namespace CliListApp
         private const string InstalledValueName = "InstalledPath";
 
         private static readonly string InstallDirectory = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "CLIList"
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".cli-list"
         );
 
         private static readonly string[] ContextMenuPaths = new[]
