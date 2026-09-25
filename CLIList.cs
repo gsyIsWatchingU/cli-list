@@ -3959,9 +3959,6 @@ namespace CliListApp
                 Padding = new Padding(0, 12, 0, 0)
             };
 
-            var closeButton = CreateFooterButton("关闭");
-            closeButton.Click += (sender, eventArgs) => Close();
-
             var aiEditButton = CreateFooterButton("增/删/改命令");
             aiEditButton.Click += (sender, eventArgs) =>
             {
@@ -3991,7 +3988,6 @@ namespace CliListApp
                 footer.Controls.Add(restartButton);
             }
 
-            footer.Controls.Add(closeButton);
             footer.Controls.Add(aiEditButton);
             return footer;
         }
