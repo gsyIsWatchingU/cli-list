@@ -17,6 +17,7 @@ usage.json.tmp
 cli-list-error.log
 commands.local.json
 commands.pre-shared-migration.json
+.dev-sync.lock
 
 # 开发备份与临时文件
 CLIList_backup.cs
@@ -29,6 +30,7 @@ show-only-screen1.bat
 # 编辑器与系统文件
 .vs/
 .vscode/
+.workbuddy/
 *.user
 *.suo
 Thumbs.db

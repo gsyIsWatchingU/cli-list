@@ -76,8 +76,9 @@ $shortcutPath = Join-Path $desktopDirectory 'CLI List.lnk'
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $executablePath
+$shortcut.Arguments = '--dev-sync'
 $shortcut.WorkingDirectory = $env:USERPROFILE
-$shortcut.Description = '打开 CLI List 命令面板'
+$shortcut.Description = '打开 CLI List 命令面板（源码开发模式，自动同步最新源码）'
 $shortcut.IconLocation = "$iconPath,0"
 $shortcut.Save()
 

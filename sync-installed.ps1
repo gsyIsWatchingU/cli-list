@@ -139,6 +139,7 @@ try {
         'travel-test-start.cmd',
         'travel-test-start.vbs',
         'update-helper.ps1',
+        'dev-sync.ps1',
         'sync-installed.ps1',
         'uninstall.ps1'
     )
