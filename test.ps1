@@ -407,6 +407,12 @@ finally {
 # ---- 源码开发模式（任务栏 --dev-sync）自动化测试 ----
 # 使用临时源码工作区与临时安装目录，复用真实 dev-sync.ps1 / build.ps1 / CLIList.cs，
 # 用测试桩 test.ps1 只做构建、不递归运行真实测试。
+# 子进程 powershell.exe（Windows PowerShell 5.1）从 pwsh 7 父进程启动时会继承
+# pwsh 的 PSModulePath（含 pwsh 专用模块目录），导致 5.1 无法加载
+# Microsoft.PowerShell.Utility（Get-FileHash 等 cmdlet 不可用）。此处显式给
+# 全部子进程设置经典 5.1 模块路径，保证在 5.1 与 pwsh 7 宿主下行为一致。
+$savedPsModulePath = $env:PSModulePath
+$env:PSModulePath = (Join-Path $env:USERPROFILE 'Documents\WindowsPowerShell\Modules') + ';' + (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules') + ';' + (Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\Modules')
 $devSyncTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('cli-list-dev-sync-test-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $devSyncTestRoot | Out-Null
 try {
@@ -429,7 +435,7 @@ try {
 
     $stubRunLog = Join-Path $devSyncTestRoot 'stub-runs.log'
     $env:CLILIST_DEV_SYNC_STUB_LOG = $stubRunLog
-    @'
+    $stubSource = @'
 param([switch]$SkipBuild, [switch]$SkipInstalledSync, [switch]$Release)
 $ErrorActionPreference = 'Stop'
 $log = [Environment]::GetEnvironmentVariable('CLILIST_DEV_SYNC_STUB_LOG')
@@ -439,7 +445,10 @@ if (-not $SkipBuild) {
     if ($LASTEXITCODE -ne 0) { throw "桩构建失败，退出码：$LASTEXITCODE" }
 }
 Add-Content -LiteralPath $log -Value (Get-Date -Format 'o') -Encoding UTF8
-'@ | Set-Content -LiteralPath (Join-Path $sourceDir 'test.ps1') -Encoding UTF8
+'@
+    # 桩 test.ps1 由子进程 Windows PowerShell 5.1 解析，必须带 UTF-8 BOM，
+    # 否则 5.1 按 ANSI 误读中文导致语法错误（pwsh 7 的 Set-Content 默认不写 BOM）。
+    [IO.File]::WriteAllText((Join-Path $sourceDir 'test.ps1'), $stubSource, (New-Object Text.UTF8Encoding $true))
 
     $installExePath = Join-Path $installDir 'CLIList.exe'
     $repoExePath = Join-Path $PSScriptRoot 'CLIList.exe'
@@ -542,6 +551,7 @@ throw '模拟源码测试失败'
     }
 }
 finally {
+    $env:PSModulePath = $savedPsModulePath
     Remove-Item Env:CLILIST_DEV_SYNC_STUB_LOG -ErrorAction SilentlyContinue
     $resolvedDevSyncTestRoot = [IO.Path]::GetFullPath($devSyncTestRoot)
     $resolvedSystemTemporaryDirectory = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
