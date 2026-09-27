@@ -592,6 +592,8 @@ namespace CliListApp
                 bool isBuiltInAction = string.Equals(command.Action, "BrowsePowerShell", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(command.Action, "OpenBrowser", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(command.Action, "ChooseIdeOrCli", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(command.Action, "ChooseSkillPackerMode", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(command.Action, "ChooseDeskXMode", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(command.Action, "CheckUpdate", StringComparison.OrdinalIgnoreCase);
                 if (!command.Disabled && (string.IsNullOrWhiteSpace(command.Name) || (!isBuiltInAction && string.IsNullOrWhiteSpace(command.Executable))))
                 {
@@ -4513,6 +4515,23 @@ namespace CliListApp
                     return;
                 }
 
+
+                if (string.Equals(command.Action, "ChooseSkillPackerMode", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(command.Action, "ChooseDeskXMode", StringComparison.OrdinalIgnoreCase))
+                {
+                    LaunchModePickerForm picker = command.Action.IndexOf("SkillPacker", StringComparison.OrdinalIgnoreCase) >= 0
+                        ? LaunchModePickerForm.LaunchModePickerForSkillPacker(appDirectory)
+                        : LaunchModePickerForm.LaunchModePickerForDeskX(appDirectory);
+                    using (picker)
+                    {
+                        if (picker.ShowDialog(this) == DialogResult.OK)
+                        {
+                            usageTracker.Record(command);
+                            RefreshCommandList();
+                        }
+                    }
+                    return;
+                }
                 if (string.Equals(command.Action, "CheckUpdate", StringComparison.OrdinalIgnoreCase))
                 {
                     usageTracker.Record(command);
@@ -5008,6 +5027,316 @@ namespace CliListApp
         }
     }
 
+
+    internal sealed class LaunchModeOption
+    {
+        public string Title;
+        public string Subtitle;
+        public string StatusText;
+        public ProcessStartInfo StartInfo;
+        public bool Available;
+    }
+
+    internal sealed class LaunchModePickerForm : Form
+    {
+        private readonly Color background = Color.FromArgb(244, 245, 239);
+        private readonly Color surface = Color.FromArgb(255, 255, 252);
+        private readonly Color surfaceHover = Color.FromArgb(226, 235, 224);
+        private readonly Color borderColor = Color.FromArgb(23, 28, 24);
+        private readonly Color textPrimary = Color.FromArgb(23, 28, 24);
+        private readonly Color textSecondary = Color.FromArgb(91, 102, 94);
+        private readonly Color accent = Color.FromArgb(151, 179, 155);
+        private readonly LaunchModeOption defaultOption;
+        private readonly LaunchModeOption packagedOption;
+        private Label statusLabel;
+
+        public LaunchModePickerForm(string appDirectory, string title, string subtitle,
+            LaunchModeOption defaultOption, LaunchModeOption packagedOption)
+        {
+            this.defaultOption = defaultOption;
+            this.packagedOption = packagedOption;
+
+            Text = title;
+            StartPosition = FormStartPosition.CenterParent;
+            MinimumSize = new Size(560, 420);
+            Size = new Size(640, 460);
+            BackColor = background;
+            ForeColor = textPrimary;
+            Font = new Font("Microsoft YaHei UI", 9F);
+            AutoScaleMode = AutoScaleMode.Dpi;
+
+            string iconPath = Path.Combine(appDirectory, "cli-list.ico");
+            if (File.Exists(iconPath))
+            {
+                Icon = new Icon(iconPath);
+            }
+
+            Controls.Add(CreateLayout(title, subtitle));
+        }
+
+        private Control CreateLayout(string title, string subtitle)
+        {
+            var root = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 1,
+                RowCount = 3,
+                Padding = new Padding(20)
+            };
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 60F));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            root.RowStyles.Add(new RowStyle(SizeType.Absolute, 56F));
+
+            var header = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 1,
+                RowCount = 2,
+                Margin = new Padding(0, 0, 0, 8)
+            };
+            header.RowStyles.Add(new RowStyle(SizeType.Absolute, 30F));
+            header.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            header.Controls.Add(new Label
+            {
+                Text = "[ LAUNCH ]  " + title,
+                Dock = DockStyle.Fill,
+                ForeColor = textPrimary,
+                BackColor = accent,
+                Font = new Font("Consolas", 11F, FontStyle.Bold),
+                TextAlign = ContentAlignment.MiddleLeft,
+                Padding = new Padding(10, 0, 0, 0)
+            }, 0, 0);
+            header.Controls.Add(new Label
+            {
+                Text = subtitle,
+                Dock = DockStyle.Fill,
+                ForeColor = textSecondary,
+                Font = new Font("Microsoft YaHei UI", 8.5F),
+                TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                Padding = new Padding(2, 0, 0, 0)
+            }, 0, 1);
+
+            var list = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                AutoScroll = false,
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                BackColor = background,
+                Padding = new Padding(0, 4, 8, 4)
+            };
+            Button defaultButton = CreateOptionButton(defaultOption, true);
+            Button packagedButton = CreateOptionButton(packagedOption, false);
+            list.Controls.Add(defaultButton);
+            list.Controls.Add(packagedButton);
+
+            var footer = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = background,
+                ColumnCount = 2,
+                RowCount = 1,
+                Padding = new Padding(0, 8, 0, 6)
+            };
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 100F));
+            statusLabel = new Label
+            {
+                Dock = DockStyle.Fill,
+                ForeColor = textSecondary,
+                Font = new Font("Microsoft YaHei UI", 8.5F),
+                TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                Padding = new Padding(4, 0, 0, 4),
+                Text = "回车 = 开发模式（默认），Esc = 取消。"
+            };
+            var closeButton = CreateFooterButton("取消");
+            closeButton.Click += (sender, eventArgs) => Close();
+            footer.Controls.Add(statusLabel, 0, 0);
+            footer.Controls.Add(closeButton, 1, 0);
+
+            root.Controls.Add(header, 0, 0);
+            root.Controls.Add(list, 0, 1);
+            root.Controls.Add(footer, 0, 2);
+
+            AcceptButton = defaultButton;
+            CancelButton = closeButton;
+            return root;
+        }
+
+        private Button CreateOptionButton(LaunchModeOption option, bool isDefault)
+        {
+            var button = new Button
+            {
+                Tag = option,
+                Width = 580,
+                Height = 84,
+                Margin = new Padding(2, 3, 2, 8),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = isDefault ? accent : surface,
+                ForeColor = textPrimary,
+                Text = option.Title + (isDefault ? "   （默认）" : string.Empty) + Environment.NewLine
+                    + option.Subtitle + Environment.NewLine
+                    + (string.IsNullOrEmpty(option.StatusText) ? string.Empty : option.StatusText),
+                TextAlign = ContentAlignment.MiddleLeft,
+                Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold),
+                Cursor = option.Available ? Cursors.Hand : Cursors.Default,
+                Enabled = option.Available,
+                UseVisualStyleBackColor = false,
+                Padding = new Padding(12, 8, 8, 4)
+            };
+            button.FlatAppearance.BorderColor = borderColor;
+            button.FlatAppearance.BorderSize = 2;
+            button.FlatAppearance.MouseOverBackColor = surfaceHover;
+            if (option.Available)
+            {
+                button.Click += (sender, eventArgs) => Launch(option);
+            }
+            else
+            {
+                button.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular);
+            }
+            return button;
+        }
+
+        private Button CreateFooterButton(string text)
+        {
+            var button = new Button
+            {
+                Text = text,
+                Dock = DockStyle.Fill,
+                Height = 38,
+                Margin = new Padding(4),
+                ForeColor = textPrimary,
+                BackColor = surface,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+                Cursor = Cursors.Hand,
+                UseVisualStyleBackColor = false
+            };
+            button.FlatAppearance.BorderColor = borderColor;
+            button.FlatAppearance.BorderSize = 2;
+            return button;
+        }
+
+        private void Launch(LaunchModeOption option)
+        {
+            try
+            {
+                Process.Start(option.StartInfo);
+                DialogResult = DialogResult.OK;
+                Close();
+            }
+            catch (Exception exception)
+            {
+                statusLabel.Text = "启动失败：" + exception.Message;
+            }
+        }
+
+        private static string CliListDir()
+        {
+            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".cli-list");
+        }
+
+        public static LaunchModePickerForm LaunchModePickerForSkillPacker(string appDirectory)
+        {
+            string wscript = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                "System32", "wscript.exe");
+            string devVbs = Path.Combine(CliListDir(), "skill-atlas-desktop.vbs");
+            string packagedExe = @"E:\prj-gsy\skill-atlas\outputs\win-unpacked-tray-2.3.0\win-unpacked\Skill Packer.exe";
+
+            var devOption = new LaunchModeOption
+            {
+                Title = "开发模式",
+                Subtitle = "从源码启动（node scripts/desktop.js），保留控制台日志",
+                StatusText = devVbs,
+                Available = File.Exists(devVbs),
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = wscript,
+                    Arguments = "//B \"" + devVbs + "\"",
+                    WorkingDirectory = @"E:\prj-gsy\skill-atlas",
+                    UseShellExecute = true
+                }
+            };
+            if (!devOption.Available)
+            {
+                devOption.StatusText = "未找到启动脚本：" + devVbs;
+            }
+
+            var packagedOption = new LaunchModeOption
+            {
+                Title = "安装包模式",
+                Subtitle = "启动已打包的 Skill Packer.exe（原生窗口，无控制台）",
+                StatusText = packagedExe,
+                Available = File.Exists(packagedExe),
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = packagedExe,
+                    WorkingDirectory = Path.GetDirectoryName(packagedExe),
+                    UseShellExecute = true
+                }
+            };
+            if (!packagedOption.Available)
+            {
+                packagedOption.StatusText = "未找到打包产物，请先 npm run dist";
+            }
+
+            return new LaunchModePickerForm(appDirectory, "启动 Skill Packer",
+                "选择启动方式（回车默认开发模式）", devOption, packagedOption);
+        }
+
+        public static LaunchModePickerForm LaunchModePickerForDeskX(string appDirectory)
+        {
+            string wscript = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                "System32", "wscript.exe");
+            string devVbs = Path.Combine(CliListDir(), "tool-desk-start.vbs");
+            string packagedExe = @"E:\prj-gsy\tool-desk\dist\win-unpacked\Desk X.exe";
+
+            var devOption = new LaunchModeOption
+            {
+                Title = "开发模式",
+                Subtitle = "从源码启动（npm start = electron .），保留控制台日志",
+                StatusText = devVbs,
+                Available = File.Exists(devVbs),
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = wscript,
+                    Arguments = "//B \"" + devVbs + "\"",
+                    WorkingDirectory = @"E:\prj-gsy\tool-desk",
+                    UseShellExecute = true
+                }
+            };
+            if (!devOption.Available)
+            {
+                devOption.StatusText = "未找到启动脚本：" + devVbs;
+            }
+
+            var packagedOption = new LaunchModeOption
+            {
+                Title = "安装包模式",
+                Subtitle = "启动已打包的 Desk X.exe（原生窗口，无控制台）",
+                StatusText = packagedExe,
+                Available = File.Exists(packagedExe),
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = packagedExe,
+                    WorkingDirectory = Path.GetDirectoryName(packagedExe),
+                    UseShellExecute = true
+                }
+            };
+            if (!packagedOption.Available)
+            {
+                packagedOption.StatusText = "未找到打包产物，请先 npm run build";
+            }
+
+            return new LaunchModePickerForm(appDirectory, "启动 Desk X",
+                "选择启动方式（回车默认开发模式）", devOption, packagedOption);
+        }
+    }
     internal sealed class BrowserPickerForm : Form
     {
         private readonly Color background = Color.FromArgb(244, 245, 239);
