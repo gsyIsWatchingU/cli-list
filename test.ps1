@@ -38,6 +38,20 @@ if ($sourceText -notmatch 'private void RestartForDevelopment') {
     throw 'CLI List 缺少开发版“立即重启”实现。'
 }
 
+$deskXLauncherPath = Join-Path $PSScriptRoot 'tool-desk-start.cmd'
+$deskXLauncherText = Get-Content -LiteralPath $deskXLauncherPath -Raw -Encoding UTF8
+if ($sourceText -match 'tool-desk-start\.vbs' -or (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'tool-desk-start.vbs'))) {
+    throw 'Desk X 开发模式不得保留静默 VBS 启动入口。'
+}
+if ($sourceText -notmatch 'FileName = commandPrompt' -or
+    $sourceText -notmatch 'WindowStyle = ProcessWindowStyle\.Normal' -or
+    $sourceText -notmatch '显示控制台日志和错误') {
+    throw 'Desk X 开发模式必须使用可见 CMD 窗口启动并明确显示日志。'
+}
+if ($deskXLauncherText -match '--hidden|TOOL_DESK_HIDDEN_START|wscript') {
+    throw 'Desk X 开发模式启动脚本不得包含隐藏启动逻辑。'
+}
+
 if (-not $SkipBuild) {
     & (Join-Path $PSScriptRoot 'build.ps1') -SkipInstalledSync:$SkipInstalledSync -Release:$Release
 }
@@ -426,7 +440,7 @@ try {
         'gpu-trae.vbs', 'minimize-all.vbs',
         'skill-atlas-desktop.cmd', 'skill-atlas-desktop.vbs',
         'skill-atlas-dev.cmd', 'skill-atlas-dev.vbs',
-        'tool-desk-start.cmd', 'tool-desk-start.vbs',
+        'tool-desk-start.cmd',
         'travel-test-start.cmd', 'travel-test-start.vbs',
         'sync-installed.ps1', 'uninstall.ps1'
     )) {
@@ -455,6 +469,7 @@ Add-Content -LiteralPath $log -Value (Get-Date -Format 'o') -Encoding UTF8
     Copy-Item -LiteralPath $repoExePath -Destination $installExePath
     Set-Content -LiteralPath (Join-Path $installDir 'commands.local.json') -Value '[{"Id":"personal","Name":"个人命令","Executable":"cmd.exe"}]' -Encoding UTF8
     Set-Content -LiteralPath (Join-Path $installDir 'usage.json') -Value '{"open-powershell":3}' -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $installDir 'tool-desk-start.vbs') -Value 'obsolete hidden launcher' -Encoding UTF8
     $localHashBefore = (Get-FileHash -LiteralPath (Join-Path $installDir 'commands.local.json') -Algorithm SHA256).Hash
     $usageHashBefore = (Get-FileHash -LiteralPath (Join-Path $installDir 'usage.json') -Algorithm SHA256).Hash
 
@@ -467,6 +482,9 @@ Add-Content -LiteralPath $log -Value (Get-Date -Format 'o') -Encoding UTF8
     $stateAfterA = Get-Content -LiteralPath (Join-Path $installDir '.dev-sync-state.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($stateAfterA.SourceDirectory -ne $sourceDir -or [string]::IsNullOrWhiteSpace($stateAfterA.Fingerprint)) {
         throw '同步后状态文件未记录源码路径与指纹。'
+    }
+    if (Test-Path -LiteralPath (Join-Path $installDir 'tool-desk-start.vbs')) {
+        throw '源码同步后仍残留 Desk X 静默 VBS 启动入口。'
     }
     if ((Get-FileHash -LiteralPath $installExePath -Algorithm SHA256).Hash -ne
         (Get-FileHash -LiteralPath (Join-Path $sourceDir 'CLIList.exe') -Algorithm SHA256).Hash) {

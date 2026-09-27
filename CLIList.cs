@@ -5291,28 +5291,28 @@ namespace CliListApp
 
         public static LaunchModePickerForm LaunchModePickerForDeskX(string appDirectory)
         {
-            string wscript = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),
-                "System32", "wscript.exe");
-            string devVbs = Path.Combine(CliListDir(), "tool-desk-start.vbs");
+            string commandPrompt = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe");
+            string devCmd = Path.Combine(CliListDir(), "tool-desk-start.cmd");
             string packagedExe = @"E:\prj-gsy\tool-desk\dist\win-unpacked\Desk X.exe";
 
             var devOption = new LaunchModeOption
             {
                 Title = "开发模式",
-                Subtitle = "从源码启动（npm start = electron .），保留控制台日志",
-                StatusText = devVbs,
-                Available = File.Exists(devVbs),
+                Subtitle = "从源码启动（npm start = electron .），显示控制台日志和错误",
+                StatusText = devCmd,
+                Available = File.Exists(devCmd),
                 StartInfo = new ProcessStartInfo
                 {
-                    FileName = wscript,
-                    Arguments = "//B \"" + devVbs + "\"",
+                    FileName = commandPrompt,
+                    Arguments = "/D /K \"\"" + devCmd + "\"\"",
                     WorkingDirectory = @"E:\prj-gsy\tool-desk",
-                    UseShellExecute = true
+                    UseShellExecute = true,
+                    WindowStyle = ProcessWindowStyle.Normal
                 }
             };
             if (!devOption.Available)
             {
-                devOption.StatusText = "未找到启动脚本：" + devVbs;
+                devOption.StatusText = "未找到启动脚本：" + devCmd;
             }
 
             var packagedOption = new LaunchModeOption

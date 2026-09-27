@@ -135,7 +135,6 @@ try {
         'skill-atlas-dev.cmd',
         'skill-atlas-dev.vbs',
         'tool-desk-start.cmd',
-        'tool-desk-start.vbs',
         'travel-test-start.cmd',
         'travel-test-start.vbs',
         'update-helper.ps1',
@@ -149,6 +148,9 @@ try {
             Copy-FileWithRetry -Source $sourcePath -Destination (Join-Path $installDirectory $fileName)
         }
     }
+
+    # Desk X 开发模式必须显示控制台；移除旧版静默 VBS 入口。
+    Remove-Item -LiteralPath (Join-Path $installDirectory 'tool-desk-start.vbs') -Force -ErrorAction SilentlyContinue
 
     $binDirectory = Join-Path $env:USERPROFILE 'bin'
     New-Item -ItemType Directory -Path $binDirectory -Force | Out-Null
