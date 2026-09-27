@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -218,9 +218,18 @@ namespace CliListApp
                 string suppliedContext = GetContextArgument(args);
                 string contextPath = ResolveContextDirectory(suppliedContext);
 
-                if (devSyncRequested && DeveloperSync.TryRun(appDirectory, suppliedContext))
+                if (devSyncRequested)
                 {
-                    return;
+                    DeveloperSync.Outcome devSyncOutcome = DeveloperSync.TryRun(appDirectory, suppliedContext);
+                    if (devSyncOutcome == DeveloperSync.Outcome.Relaunched)
+                    {
+                        return;
+                    }
+                    if (devSyncOutcome == DeveloperSync.Outcome.FailedAbort)
+                    {
+                        Environment.ExitCode = 0;
+                        return;
+                    }
                 }
 
                 if (Installer.TryEnsureInstalled(appDirectory, suppliedContext, residentRequested))
@@ -631,17 +640,28 @@ namespace CliListApp
     }
 
     /// <summary>
-    /// 源码开发模式：以 .source-repository 标记的源码仓库为准，
-    /// 当源码比安装版新时重新编译并同步，然后用最新版本重新启动。
-    /// 任何失败都不会阻塞启动，只是回落到现有安装版。
+    /// 源码开发模式（仅任务栏 --dev-sync 入口启用）：以安装目录 .dev-sync-state.json
+    /// 记录的源码路径与指纹为准，只检查本机源码工作区，不联网、不拉取 GitHub。
+    /// 源码有变化时由 dev-sync.ps1 先执行完整 test.ps1，测试通过后再同步并重启新版本；
+    /// 任何失败都不会阻塞启动，只是回落到上次成功版本（由用户确认是否启动）。
     /// </summary>
     internal static class DeveloperSync
     {
         private const string SourceMarkerFileName = ".source-repository";
-        private const int SyncTimeoutMilliseconds = 180000;
+        private const string StateFileName = ".dev-sync-state.json";
+        private const int SyncTimeoutMilliseconds = 600000;
+        private const string DevSyncGuardVariable = "CLILIST_DEV_SYNC_DONE";
 
-        // 返回 true 表示已经转交给重新启动的新版本，当前进程应直接退出。
-        public static bool TryRun(string appDirectory, string contextArgument)
+        /// <summary>同步结果：NotNeeded 无需同步；Relaunched 已转交新版本；失败时由用户决定。</summary>
+        internal enum Outcome
+        {
+            NotNeeded,
+            Relaunched,
+            FailedContinue,
+            FailedAbort
+        }
+
+        public static Outcome TryRun(string appDirectory, string contextArgument)
         {
             // 已由上一次同步重启而来，本次不应再次触发同步，避免死循环。
             if (string.Equals(
@@ -649,7 +669,7 @@ namespace CliListApp
                 "1",
                 StringComparison.Ordinal))
             {
-                return false;
+                return Outcome.NotNeeded;
             }
 
             string installDirectory = Path.GetFullPath(appDirectory)
@@ -658,27 +678,24 @@ namespace CliListApp
             string sourceDirectory = ResolveSourceDirectory(installDirectory);
             if (string.IsNullOrWhiteSpace(sourceDirectory))
             {
-                return false;
+                return Outcome.NotNeeded;
             }
 
             string sourceCodePath = Path.Combine(sourceDirectory, "CLIList.cs");
             string installedExecutablePath = Path.Combine(installDirectory, "CLIList.exe");
             if (!File.Exists(sourceCodePath) || !File.Exists(installedExecutablePath))
             {
-                return false;
-            }
-
-            if (IsInstalledUpToDate(sourceDirectory, installedExecutablePath))
-            {
-                return false;
+                return Outcome.NotNeeded;
             }
 
             string syncScriptPath = Path.Combine(sourceDirectory, "dev-sync.ps1");
             if (!File.Exists(syncScriptPath))
             {
-                return false;
+                return Outcome.NotNeeded;
             }
 
+            int exitCode;
+            string capturedOutput;
             try
             {
                 var startInfo = new ProcessStartInfo
@@ -687,36 +704,60 @@ namespace CliListApp
                     Arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File " +
                         QuoteArgument(syncScriptPath) +
                         " -SourceDirectory " + QuoteArgument(sourceDirectory) +
-                        " -InstallDirectory " + QuoteArgument(installDirectory),
+                        " -InstallDirectory " + QuoteArgument(installDirectory) +
+                        " -CallerPid " + Process.GetCurrentProcess().Id,
                     WorkingDirectory = sourceDirectory,
                     UseShellExecute = false,
-                    CreateNoWindow = true
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
                 };
 
-                using (Process syncProcess = Process.Start(startInfo))
+                using (Process syncProcess = new Process())
                 {
-                    if (syncProcess == null || !syncProcess.WaitForExit(SyncTimeoutMilliseconds))
+                    var captured = new List<string>();
+                    syncProcess.StartInfo = startInfo;
+                    syncProcess.OutputDataReceived += (sender, e) => { if (!string.IsNullOrEmpty(e.Data)) captured.Add(e.Data); };
+                    syncProcess.ErrorDataReceived += (sender, e) => { if (!string.IsNullOrEmpty(e.Data)) captured.Add(e.Data); };
+                    syncProcess.Start();
+                    syncProcess.BeginOutputReadLine();
+                    syncProcess.BeginErrorReadLine();
+                    if (!syncProcess.WaitForExit(SyncTimeoutMilliseconds))
                     {
-                        if (syncProcess != null)
-                        {
-                            TryKill(syncProcess);
-                        }
-                        return false;
+                        TryKill(syncProcess);
+                        return Outcome.FailedContinue;
                     }
-
-                    if (syncProcess.ExitCode != 0)
-                    {
-                        return false;
-                    }
+                    exitCode = syncProcess.ExitCode;
+                    capturedOutput = string.Join(Environment.NewLine, captured);
                 }
             }
             catch
             {
-                return false;
+                return Outcome.FailedContinue;
             }
 
-            // 同步脚本已经写入了新 exe，转交新进程（带 --dev-sync 保证下次启动仍检查）。
-            // 设环境变量守卫，避免极端情况下（如时间戳精度）出现重复同步的死循环。
+            if (exitCode == 2)
+            {
+                // 同步脚本已经写入了新 exe，转交新进程（带 --dev-sync 保证下次启动仍检查）。
+                return Relaunch(installedExecutablePath, contextArgument)
+                    ? Outcome.Relaunched
+                    : Outcome.FailedContinue;
+            }
+
+            if (exitCode != 0)
+            {
+                // 同步失败：脚本已自动恢复原程序，询问是否启动上次成功版本。
+                return AskLaunchLastSuccessful(capturedOutput)
+                    ? Outcome.FailedContinue
+                    : Outcome.FailedAbort;
+            }
+
+            // 无需同步：当前进程直接走正常启动流程。
+            return Outcome.NotNeeded;
+        }
+
+        private static bool Relaunch(string installedExecutablePath, string contextArgument)
+        {
             try
             {
                 var relaunchArguments = new List<string>();
@@ -731,8 +772,9 @@ namespace CliListApp
                     FileName = installedExecutablePath,
                     Arguments = string.Join(" ", relaunchArguments),
                     WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                    UseShellExecute = true
+                    UseShellExecute = false
                 };
+                // 设环境变量守卫，避免极端情况下出现重复同步的死循环。
                 relaunchInfo.EnvironmentVariables[DevSyncGuardVariable] = "1";
 
                 Process.Start(relaunchInfo);
@@ -744,14 +786,49 @@ namespace CliListApp
             }
         }
 
-        private const string DevSyncGuardVariable = "CLILIST_DEV_SYNC_DONE";
+        private static bool AskLaunchLastSuccessful(string failureDetail)
+        {
+            string reason = string.IsNullOrWhiteSpace(failureDetail) ? "未获取到详细信息。" : failureDetail.Trim();
+            if (reason.Length > 800)
+            {
+                reason = reason.Substring(0, 800) + "…";
+            }
+
+            return MessageBox.Show(
+                "源码同步失败，已自动恢复原程序。\n\n失败原因：\n" + reason + "\n\n是否启动上次成功版本？",
+                "CLI List 源码同步",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning
+            ) == DialogResult.Yes;
+        }
 
         /// <summary>
-        /// 解析源码仓库路径：优先读安装目录的 .source-repository 标记；
-        /// 标记缺失时回落到常见的源码位置，保证首次启用也能生效。
+        /// 解析源码仓库路径：优先读安装目录的 .dev-sync-state.json（源码路径 + 指纹）；
+        /// 再读旧版 .source-repository 标记；标记均缺失时回落到常见源码位置。
         /// </summary>
         private static string ResolveSourceDirectory(string installDirectory)
         {
+            string statePath = Path.Combine(installDirectory, StateFileName);
+            if (File.Exists(statePath))
+            {
+                try
+                {
+                    string stateJson = File.ReadAllText(statePath).TrimStart('\uFEFF');
+                    var state = new JavaScriptSerializer().DeserializeObject(stateJson) as Dictionary<string, object>;
+                    string marked = state != null && state.ContainsKey("SourceDirectory")
+                        ? Convert.ToString(state["SourceDirectory"])
+                        : null;
+                    if (IsValidSourceDirectory(marked))
+                    {
+                        return Path.GetFullPath(marked);
+                    }
+                }
+                catch
+                {
+                    // 状态文件损坏时继续走回落逻辑。
+                }
+            }
+
             string markerPath = Path.Combine(installDirectory, SourceMarkerFileName);
             if (File.Exists(markerPath))
             {
@@ -782,7 +859,7 @@ namespace CliListApp
 
         private static IEnumerable<string> GetFallbackSourceCandidates()
         {
-            yield return @"E:\new-prj\cli-list";
+            yield return @"E:\prj-gsy\cli-list";
             yield return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "cli-list");
             yield return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "source", "cli-list");
         }
@@ -807,31 +884,6 @@ namespace CliListApp
             }
         }
 
-        private static bool IsInstalledUpToDate(string sourceDirectory, string installedExecutablePath)
-        {
-            try
-            {
-                DateTime installedWriteTime = File.GetLastWriteTimeUtc(installedExecutablePath);
-                foreach (string candidate in new[]
-                {
-                    Path.Combine(sourceDirectory, "CLIList.cs"),
-                    Path.Combine(sourceDirectory, "cli-list.ico"),
-                    Path.Combine(sourceDirectory, "build.ps1")
-                })
-                {
-                    if (File.Exists(candidate) && File.GetLastWriteTimeUtc(candidate) > installedWriteTime)
-                    {
-                        return false;
-                    }
-                }
-                return true;
-            }
-            catch
-            {
-                return true;
-            }
-        }
-
         private static void TryKill(Process process)
         {
             try
@@ -849,6 +901,7 @@ namespace CliListApp
             return "\"" + value.Replace("\"", "\\\"") + "\"";
         }
     }
+
 
     internal static class UpdateManager
     {
@@ -6041,7 +6094,7 @@ namespace CliListApp
                     {
                         if (commandKey != null)
                         {
-                            commandKey.SetValue(null, "\"" + executablePath + "\" --dev-sync \"" + placeholder + "\"");
+                            commandKey.SetValue(null, "\"" + executablePath + "\"" + placeholder + "\"");
                         }
                     }
                 }
@@ -6056,8 +6109,8 @@ namespace CliListApp
             CreateShortcut(
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "CLI List.lnk"),
                 executablePath,
-                "--dev-sync",
-                "打开 CLI List 命令面板（源码开发模式，自动同步最新源码）"
+                "",
+                "打开 CLI List 命令面板"
             );
 
             using (RegistryKey key = Registry.CurrentUser.CreateSubKey(RegistryKeyPath))

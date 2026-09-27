@@ -18,6 +18,9 @@ cli-list-error.log
 commands.local.json
 commands.pre-shared-migration.json
 .dev-sync.lock
+.dev-sync-state.json
+CLIList.exe.previous
+CLIList.exe.staged
 
 # 开发备份与临时文件
 CLIList_backup.cs

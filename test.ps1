@@ -404,4 +404,151 @@ finally {
     }
 }
 
+# ---- 源码开发模式（任务栏 --dev-sync）自动化测试 ----
+# 使用临时源码工作区与临时安装目录，复用真实 dev-sync.ps1 / build.ps1 / CLIList.cs，
+# 用测试桩 test.ps1 只做构建、不递归运行真实测试。
+$devSyncTestRoot = Join-Path ([IO.Path]::GetTempPath()) ('cli-list-dev-sync-test-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $devSyncTestRoot | Out-Null
+try {
+    $sourceDir = Join-Path $devSyncTestRoot 'src'
+    $installDir = Join-Path $devSyncTestRoot 'inst'
+    New-Item -ItemType Directory -Path $sourceDir, $installDir | Out-Null
+
+    foreach ($fileName in @(
+        'CLIList.cs', 'build.ps1', 'cli-list.ico', 'cli-list.svg', 'commands.json',
+        'cli-list.cmd', 'dev-sync.ps1', 'update-helper.ps1',
+        'gpu-trae.vbs', 'minimize-all.vbs',
+        'skill-atlas-desktop.cmd', 'skill-atlas-desktop.vbs',
+        'skill-atlas-dev.cmd', 'skill-atlas-dev.vbs',
+        'tool-desk-start.cmd', 'tool-desk-start.vbs',
+        'travel-test-start.cmd', 'travel-test-start.vbs',
+        'sync-installed.ps1', 'uninstall.ps1'
+    )) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $fileName) -Destination (Join-Path $sourceDir $fileName)
+    }
+
+    $stubRunLog = Join-Path $devSyncTestRoot 'stub-runs.log'
+    $env:CLILIST_DEV_SYNC_STUB_LOG = $stubRunLog
+    @'
+param([switch]$SkipBuild, [switch]$SkipInstalledSync, [switch]$Release)
+$ErrorActionPreference = 'Stop'
+$log = [Environment]::GetEnvironmentVariable('CLILIST_DEV_SYNC_STUB_LOG')
+if (-not $log) { throw '缺少桩日志路径 CLILIST_DEV_SYNC_STUB_LOG。' }
+if (-not $SkipBuild) {
+    & (Join-Path $PSScriptRoot 'build.ps1') -SkipInstalledSync
+    if ($LASTEXITCODE -ne 0) { throw "桩构建失败，退出码：$LASTEXITCODE" }
+}
+Add-Content -LiteralPath $log -Value (Get-Date -Format 'o') -Encoding UTF8
+'@ | Set-Content -LiteralPath (Join-Path $sourceDir 'test.ps1') -Encoding UTF8
+
+    $installExePath = Join-Path $installDir 'CLIList.exe'
+    $repoExePath = Join-Path $PSScriptRoot 'CLIList.exe'
+    Copy-Item -LiteralPath $repoExePath -Destination $installExePath
+    Set-Content -LiteralPath (Join-Path $installDir 'commands.local.json') -Value '[{"Id":"personal","Name":"个人命令","Executable":"cmd.exe"}]' -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $installDir 'usage.json') -Value '{"open-powershell":3}' -Encoding UTF8
+    $localHashBefore = (Get-FileHash -LiteralPath (Join-Path $installDir 'commands.local.json') -Algorithm SHA256).Hash
+    $usageHashBefore = (Get-FileHash -LiteralPath (Join-Path $installDir 'usage.json') -Algorithm SHA256).Hash
+
+    $devSyncScriptPath = Join-Path $sourceDir 'dev-sync.ps1'
+    $devSyncArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $devSyncScriptPath, '-SourceDirectory', $sourceDir, '-InstallDirectory', $installDir)
+
+    # 场景 A：首次同步（安装目录无状态文件）→ 构建一次、同步成功（退出码 2）。
+    & powershell.exe @devSyncArgs
+    if ($LASTEXITCODE -ne 2) { throw "首次同步应返回 2，实际 $LASTEXITCODE" }
+    $stateAfterA = Get-Content -LiteralPath (Join-Path $installDir '.dev-sync-state.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($stateAfterA.SourceDirectory -ne $sourceDir -or [string]::IsNullOrWhiteSpace($stateAfterA.Fingerprint)) {
+        throw '同步后状态文件未记录源码路径与指纹。'
+    }
+    if ((Get-FileHash -LiteralPath $installExePath -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath (Join-Path $sourceDir 'CLIList.exe') -Algorithm SHA256).Hash) {
+        throw '同步后安装版应等于源码构建产物。'
+    }
+    if ((Get-FileHash -LiteralPath (Join-Path $installDir 'commands.local.json') -Algorithm SHA256).Hash -ne $localHashBefore) {
+        throw '同步后本机 commands.local.json 被改写。'
+    }
+    if ((Get-FileHash -LiteralPath (Join-Path $installDir 'usage.json') -Algorithm SHA256).Hash -ne $usageHashBefore) {
+        throw '同步后 usage.json 被改写。'
+    }
+    $runsA = @(Get-Content -LiteralPath $stubRunLog -ErrorAction SilentlyContinue).Count
+    if ($runsA -ne 1) { throw "首次同步应恰好构建一次，实际 $runsA 次。" }
+
+    # 场景 B：源码未变化 → 直接启动（退出码 0），不重复构建、安装版不变。
+    $exeHashBeforeB = (Get-FileHash -LiteralPath $installExePath -Algorithm SHA256).Hash
+    & powershell.exe @devSyncArgs
+    if ($LASTEXITCODE -ne 0) { throw "源码未变化应返回 0，实际 $LASTEXITCODE" }
+    $runsB = @(Get-Content -LiteralPath $stubRunLog -ErrorAction SilentlyContinue).Count
+    if ($runsB -ne 1) { throw "源码未变化不应重复构建，实际 $runsB 次。" }
+    if ((Get-FileHash -LiteralPath $installExePath -Algorithm SHA256).Hash -ne $exeHashBeforeB) {
+        throw '源码未变化时安装版不应被替换。'
+    }
+
+    # 场景 C：构建失败 → 退出码 1，安装版未被破坏、状态文件未被污染。
+    $failSourceDir = Join-Path $devSyncTestRoot 'src-fail'
+    New-Item -ItemType Directory -Path $failSourceDir | Out-Null
+    Get-ChildItem -LiteralPath $sourceDir -File | Copy-Item -Destination $failSourceDir -Force
+    @'
+param([switch]$SkipBuild, [switch]$SkipInstalledSync, [switch]$Release)
+$ErrorActionPreference = 'Stop'
+throw '模拟源码测试失败'
+'@ | Set-Content -LiteralPath (Join-Path $failSourceDir 'test.ps1') -Encoding UTF8
+    $exeHashBeforeC = (Get-FileHash -LiteralPath $installExePath -Algorithm SHA256).Hash
+    $stateTextBeforeC = Get-Content -LiteralPath (Join-Path $installDir '.dev-sync-state.json') -Raw -Encoding UTF8
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $failSourceDir 'dev-sync.ps1') `
+        -SourceDirectory $failSourceDir -InstallDirectory $installDir
+    if ($LASTEXITCODE -ne 1) { throw "构建失败应返回 1，实际 $LASTEXITCODE" }
+    $global:LASTEXITCODE = 0
+    if ((Get-FileHash -LiteralPath $installExePath -Algorithm SHA256).Hash -ne $exeHashBeforeC) {
+        throw '构建失败后安装版不应被替换。'
+    }
+    if ((Get-Content -LiteralPath (Join-Path $installDir '.dev-sync-state.json') -Raw -Encoding UTF8) -ne $stateTextBeforeC) {
+        throw '构建失败后状态文件不应被改写。'
+    }
+
+    # 场景 D：切换后写入状态失败 → 自动回滚，安装版恢复为旧版、无残留。
+    $installDir2 = Join-Path $devSyncTestRoot 'inst2'
+    New-Item -ItemType Directory -Path $installDir2 | Out-Null
+    Copy-Item -LiteralPath $repoExePath -Destination (Join-Path $installDir2 'CLIList.exe')
+    New-Item -ItemType Directory -Path (Join-Path $installDir2 '.dev-sync-state.json') | Out-Null
+    $oldExeHashD = (Get-FileHash -LiteralPath (Join-Path $installDir2 'CLIList.exe') -Algorithm SHA256).Hash
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $devSyncScriptPath -SourceDirectory $sourceDir -InstallDirectory $installDir2
+    if ($LASTEXITCODE -ne 1) { throw "状态写入失败应返回 1，实际 $LASTEXITCODE" }
+    $global:LASTEXITCODE = 0
+    if ((Get-FileHash -LiteralPath (Join-Path $installDir2 'CLIList.exe') -Algorithm SHA256).Hash -ne $oldExeHashD) {
+        throw '切换失败后未回滚安装版。'
+    }
+    if (Test-Path -LiteralPath (Join-Path $installDir2 'CLIList.exe.staged')) { throw '切换失败后残留暂存文件。' }
+    if (Test-Path -LiteralPath (Join-Path $installDir2 'CLIList.exe.previous')) { throw '切换失败后残留备份文件。' }
+
+    # 场景 E：并发点击 → 只构建一次，退出码恰好为一个 0、一个 2，安装版最终一致。
+    $installDir3 = Join-Path $devSyncTestRoot 'inst3'
+    New-Item -ItemType Directory -Path $installDir3 | Out-Null
+    Copy-Item -LiteralPath $repoExePath -Destination (Join-Path $installDir3 'CLIList.exe')
+    Add-Content -LiteralPath (Join-Path $sourceDir 'gpu-trae.vbs') -Value "`r`n' concurrency-change-20260927" -Encoding ASCII
+    $stubRunLog2 = Join-Path $devSyncTestRoot 'stub-runs2.log'
+    $env:CLILIST_DEV_SYNC_STUB_LOG = $stubRunLog2
+    $concurrentArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $devSyncScriptPath, '-SourceDirectory', $sourceDir, '-InstallDirectory', $installDir3)
+    $concurrentP1 = Start-Process -FilePath 'powershell.exe' -ArgumentList $concurrentArgs -PassThru
+    $concurrentP2 = Start-Process -FilePath 'powershell.exe' -ArgumentList $concurrentArgs -PassThru
+    Wait-Process -Id $concurrentP1.Id, $concurrentP2.Id -Timeout 420 -ErrorAction Stop
+    $concurrentCodes = @($concurrentP1.ExitCode, $concurrentP2.ExitCode) | Sort-Object
+    if (-not ($concurrentCodes[0] -eq 0 -and $concurrentCodes[1] -eq 2)) {
+        throw "并发同步应恰好一次成功，退出码：$($concurrentP1.ExitCode) / $($concurrentP2.ExitCode)"
+    }
+    $runsE = @(Get-Content -LiteralPath $stubRunLog2 -ErrorAction SilentlyContinue).Count
+    if ($runsE -ne 1) { throw "并发点击应只构建一次，实际 $runsE 次。" }
+    $stateAfterE = Get-Content -LiteralPath (Join-Path $installDir3 '.dev-sync-state.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($stateAfterE.SourceDirectory -ne $sourceDir -or [string]::IsNullOrWhiteSpace($stateAfterE.Fingerprint)) {
+        throw '并发同步后状态文件未正确记录。'
+    }
+}
+finally {
+    Remove-Item Env:CLILIST_DEV_SYNC_STUB_LOG -ErrorAction SilentlyContinue
+    $resolvedDevSyncTestRoot = [IO.Path]::GetFullPath($devSyncTestRoot)
+    $resolvedSystemTemporaryDirectory = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    if ($resolvedDevSyncTestRoot.StartsWith($resolvedSystemTemporaryDirectory, [StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item -LiteralPath $resolvedDevSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 Write-Output 'CLI List 构建与配置验证通过。'
+exit 0
